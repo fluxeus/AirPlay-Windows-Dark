@@ -77,7 +77,8 @@ jobs:
           New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
           Copy-Item -LiteralPath build\Release\airplay-windows.exe -Destination $packageDir
           Get-ChildItem build\Release -Filter *.dll -File | Copy-Item -Destination $packageDir
-          Copy-Item -LiteralPath README.md, THIRD_PARTY_NOTICES.md -Destination $packageDir
+          Copy-Item -LiteralPath README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination $packageDir
+          Copy-Item -LiteralPath docs -Destination $packageDir -Recurse
           Compress-Archive -Path "$packageDir\*" -DestinationPath $zipName -Force
           $hash = (Get-FileHash -LiteralPath $zipName -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $zipName" | Set-Content -Path "$zipName.sha256" -Encoding ascii

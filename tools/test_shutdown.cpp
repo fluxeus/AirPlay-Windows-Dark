@@ -113,32 +113,6 @@ void test_blocked_send() {
     ap::net::close_socket(client);
     std::cout << "PASS: stop interrupts blocked send\n";
 }
-void test_audio_disconnect_reset() {
-    ap::net::TcpServer server;
-    std::atomic<bool> started{false}, cleaned{false};
-    require(server.start(0, [&](ap::net::ClientSocket client) {
-        client.reset_on_disconnect->store(true);
-        started = true;
-        char byte;
-        ap::net::recv_interruptible(client.fd, &byte, 1, client.cancelled.get());
-        std::this_thread::sleep_for(30ms);
-        cleaned = true;
-    }), "audio reset server start");
-    auto client = connect_to(server.port());
-    wait_for([&] { return started.load(); });
-    server.close_all_clients();
-    require(cleaned, "audio cleanup before transport reset");
-    char byte;
-    const int received = ::recv(client, &byte, 1, 0);
-#if defined(_WIN32)
-    require(received < 0 && ap::net::last_error() == WSAECONNRESET, "audio-only sender receives explicit reset");
-#else
-    require(received < 0 && ap::net::last_error() == ECONNRESET, "audio-only sender receives explicit reset");
-#endif
-    ap::net::close_socket(client);
-    server.stop();
-    std::cout << "PASS: audio-only receiver disconnect sends RST after cleanup\n";
-}
 void test_mdns() {
     ap::airplay::DeviceContext context;
     context.name = "AirPlay shutdown regression test";
@@ -161,7 +135,6 @@ int main(int argc, char**) {
     std::thread([] { std::this_thread::sleep_for(20s); std::_Exit(2); }).detach();
     test_control_shutdown();
     test_blocked_send();
-    test_audio_disconnect_reset();
     if (argc > 1) test_mdns();
     ap::net::global_shutdown();
     return 0;

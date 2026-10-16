@@ -155,24 +155,12 @@ void TcpServer::accept_loop() {
                 close_socket(track_fd);
                 continue;
             }
-            active_clients_.emplace(track_fd, client);
+            active_clients_.emplace(track_fd, client.cancelled);
         }
         workers_.emplace_back([this, h = handler_, c = std::move(client),
                                track_fd]() mutable {
             h(std::move(c));
             std::lock_guard<std::mutex> lock(clients_mtx_);
-            const auto tracked = active_clients_.find(track_fd);
-            if (tracked != active_clients_.end() &&
-                tracked->second.cancelled->load() &&
-                tracked->second.reset_on_disconnect->load()) {
-                // Send RST after the handler has released audio/session state.
-                // Do not leave the sender with a half-closed control channel.
-                linger abortive{1, 0};
-                if (::setsockopt(track_fd, SOL_SOCKET, SO_LINGER,
-                        reinterpret_cast<const char*>(&abortive), sizeof(abortive)) != 0) {
-                    LOG_WARN << "could not request audio control reset: " << last_error_string();
-                }
-            }
             close_socket(track_fd);
             active_clients_.erase(track_fd);
             clients_cv_.notify_all();
@@ -183,11 +171,8 @@ void TcpServer::accept_loop() {
 void TcpServer::close_all_clients(const std::function<void()>& on_drained) {
     std::unique_lock<std::mutex> lock(clients_mtx_);
     disconnecting_ = true;
-    for (const auto& [fd, client] : active_clients_) {
-        client.cancelled->store(true);
-        // For audio-only sessions, let the cancellable reader unwind and
-        // close abortively below; shutdown(SD_SEND) would first send a FIN.
-        if (client.reset_on_disconnect->load()) continue;
+    for (const auto& [fd, cancelled] : active_clients_) {
+        cancelled->store(true);
 #if defined(_WIN32)
         ::shutdown(fd, SD_BOTH);
 #else

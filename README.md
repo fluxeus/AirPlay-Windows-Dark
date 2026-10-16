@@ -225,6 +225,12 @@ python -m pip install cryptography
 python tools/test_pair_verify.py
 ```
 
+Socket shutdown regression tests are available with `-DBUILD_NETWORK_TESTS=ON`.
+Build Release and run `ctest --test-dir build -C Release --output-on-failure`.
+On Windows, `build/Release/test-shutdown.exe --mdns` also exercises real DNS-SD
+registration/deregistration; inspect the callback status logs. These checks do
+not validate the mirroring indicator on an actual iOS device.
+
 For Windows GPU integration tests, configure with `-DBUILD_GPU_TESTS=ON`, build
 `test-gpu-video` in Release and run `build/Release/test-gpu-video.exe`. These tests
 require a compatible NVIDIA GPU and NVENC-enabled FFmpeg for their fixtures.

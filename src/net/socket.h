@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <string>
 
 #if defined(_WIN32)
@@ -26,6 +27,9 @@ void global_shutdown();
 void close_socket(socket_t s);
 int  last_error();
 std::string last_error_string();
+
+// Read up to len bytes, observing cancellation while idle. Does not close s.
+int recv_interruptible(socket_t s, void* buf, int len, const std::atomic<bool>* cancelled);
 
 // Read/write helpers that handle partial I/O.
 // Returns number of bytes transferred, 0 on clean close, <0 on error.

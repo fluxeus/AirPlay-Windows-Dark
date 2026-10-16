@@ -61,7 +61,7 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
     {
         char tmp[1024];
         while (headers.size() < 8192) {
-            const int n = ap::net::recv_all(client.fd, tmp, 1);
+            const int n = ap::net::recv_interruptible(client.fd, tmp, 1, client.cancelled.get());
             if (n <= 0) break;
             headers.append(tmp, 1);
             if (headers.size() >= 4 &&
@@ -132,7 +132,6 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
 
     if (path.empty()) {
         send_response(400, "Bad Request", "", "text/plain");
-        ap::net::close_socket(client.fd);
         return;
     }
 
@@ -152,7 +151,6 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
         if (cdn_url.empty()) {
             LOG_WARN << "HLS GET " << path << " -> 404 (seg id unknown)";
             send_response(404, "Not Found", "", "text/plain");
-            ap::net::close_socket(client.fd);
             return;
         }
 
@@ -218,7 +216,6 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
             av_strerror(rc, err, sizeof(err));
             LOG_WARN << "seg proxy: avio_open2 failed: " << err;
             send_response(502, "Bad Gateway", "", "text/plain");
-            ap::net::close_socket(client.fd);
             return;
         }
         const int64_t size = avio_size(avio);
@@ -308,7 +305,6 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
                  << (range_start >= 0 ? " range=yes" : " range=no")
                  << ')';
         kInFlight.fetch_sub(1);
-        ap::net::close_socket(client.fd);
         return;
     }
 
@@ -329,7 +325,6 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
                     mlhls_url, body)) {
                 LOG_WARN << "HLS GET " << path << " -> 504 (playlist fetch failed)";
                 send_response(504, "Gateway Timeout", "", "text/plain");
-                ap::net::close_socket(client.fd);
                 return;
             }
         } else if (!is_master &&
@@ -363,7 +358,6 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
                          : std::string{});
         send_response(200, "OK", body,
                       "application/vnd.apple.mpegurl");
-        ap::net::close_socket(client.fd);
         return;
     }
 
@@ -376,7 +370,6 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
     if (!HlsSessionRegistry::instance().fetch_segment(mlhls_url, seg, redirect)) {
         LOG_WARN << "HLS GET " << path << " -> 504 (segment fetch failed)";
         send_response(504, "Gateway Timeout", "", "text/plain");
-        ap::net::close_socket(client.fd);
         return;
     }
     if (!redirect.empty()) {
@@ -390,12 +383,10 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
         wire.append("Connection: close\r\n\r\n");
         ap::net::send_all(client.fd, wire.data(),
                           static_cast<int>(wire.size()));
-        ap::net::close_socket(client.fd);
         return;
     }
     LOG_INFO << "HLS GET " << path << " (segment) -> " << seg.size() << 'B';
     send_response(200, "OK", seg, "application/octet-stream");
-    ap::net::close_socket(client.fd);
 }
 
 } // namespace ap::airplay

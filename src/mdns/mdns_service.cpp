@@ -2,6 +2,9 @@
 #include "log.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -43,7 +46,7 @@ std::string narrow(PCWSTR ws) {
 
 // One registered service (either _airplay._tcp or _raop._tcp). Owns the
 // backing string storage so the PWSTR pointers inside DNS_SERVICE_INSTANCE
-// stay valid until DnsServiceRegisterCancel is called.
+// stay valid until each asynchronous DNS operation completes.
 struct RegisteredService {
     std::wstring              instance_name;   // "Name._type._tcp.local"
     std::wstring              host_name;       // "pc.local"
@@ -53,7 +56,13 @@ struct RegisteredService {
     std::vector<PWSTR>        value_ptrs;
     DNS_SERVICE_INSTANCE      instance{};
     DNS_SERVICE_CANCEL        cancel{};
-    bool                      active{false};
+    DNS_SERVICE_REGISTER_REQUEST request{};
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool pending{false};
+    bool deregistering{false};
+    DWORD status{ERROR_SUCCESS};
+    bool active{false};
 
     void fill_ptrs() {
         key_ptrs.clear();
@@ -64,46 +73,84 @@ struct RegisteredService {
 };
 
 struct MdnsService::Impl {
-    RegisteredService airplay;
-    RegisteredService raop;
+    std::shared_ptr<RegisteredService> airplay = std::make_shared<RegisteredService>();
+    std::shared_ptr<RegisteredService> raop = std::make_shared<RegisteredService>();
 
-    static void WINAPI on_register(DWORD status, PVOID /*ctx*/,
+    static void WINAPI on_complete(DWORD status, PVOID context,
                                    PDNS_SERVICE_INSTANCE inst) {
-        if (status == ERROR_SUCCESS && inst) {
-            LOG_INFO << "mDNS registered: " << narrow(inst->pszInstanceName);
-        } else {
-            LOG_ERROR << "mDNS register failed (status=" << status << ")";
-        }
+        // The callback retains all request/string storage even if shutdown
+        // times out waiting for the Windows DNS service.
+        std::unique_ptr<std::shared_ptr<RegisteredService>> owner(
+            static_cast<std::shared_ptr<RegisteredService>*>(context));
+        auto service = *owner;
         if (inst) DnsServiceFreeInstance(inst);
+        std::lock_guard<std::mutex> lock(service->mutex);
+        service->status = status;
+        service->pending = false;
+        LOG_INFO << "mDNS " << (service->deregistering ? "deregister" : "register")
+                 << ": " << narrow(service->instance_name.c_str())
+                 << " status=" << status;
+        service->cv.notify_all();
     }
 
-    bool register_service(RegisteredService& s, uint16_t port) {
+    bool register_service(const std::shared_ptr<RegisteredService>& service,
+                          uint16_t port) {
+        auto& s = *service;
         s.fill_ptrs();
-
         s.instance = {};
         s.instance.pszInstanceName = s.instance_name.data();
-        s.instance.pszHostName     = s.host_name.data();
-        s.instance.wPort           = port;
+        s.instance.pszHostName = s.host_name.data();
+        s.instance.wPort = port;
         s.instance.dwPropertyCount = static_cast<DWORD>(s.keys.size());
-        s.instance.keys            = s.key_ptrs.data();
-        s.instance.values          = s.value_ptrs.data();
-
-        DNS_SERVICE_REGISTER_REQUEST req{};
-        req.Version                    = DNS_QUERY_REQUEST_VERSION1;
-        req.InterfaceIndex             = 0;                 // all interfaces
-        req.pServiceInstance           = &s.instance;
-        req.pRegisterCompletionCallback = &on_register;
-        req.pQueryContext              = this;
-        req.unicastEnabled             = FALSE;
-
-        DWORD rc = DnsServiceRegister(&req, &s.cancel);
+        s.instance.keys = s.key_ptrs.data();
+        s.instance.values = s.value_ptrs.data();
+        s.request = {};
+        s.request.Version = DNS_QUERY_REQUEST_VERSION1;
+        s.request.pServiceInstance = &s.instance;
+        s.request.pRegisterCompletionCallback = &on_complete;
+        s.request.pQueryContext = new std::shared_ptr<RegisteredService>(service);
+        s.pending = true;
+        DWORD rc = DnsServiceRegister(&s.request, &s.cancel);
         if (rc != DNS_REQUEST_PENDING) {
-            LOG_ERROR << "DnsServiceRegister(" << narrow(s.instance_name.c_str())
-                      << ") failed: " << rc;
+            delete static_cast<std::shared_ptr<RegisteredService>*>(s.request.pQueryContext);
+            s.pending = false;
+            LOG_ERROR << "DnsServiceRegister failed: " << rc;
             return false;
         }
         s.active = true;
         return true;
+    }
+
+    void unregister_service(const std::shared_ptr<RegisteredService>& service) {
+        auto& s = *service;
+        if (!s.active) return;
+        s.active = false;
+        std::unique_lock<std::mutex> lock(s.mutex);
+        if (!s.cv.wait_for(lock, std::chrono::seconds(3), [&s] { return !s.pending; })) {
+            lock.unlock();
+            DnsServiceRegisterCancel(&s.cancel);
+            lock.lock();
+            if (!s.cv.wait_for(lock, std::chrono::seconds(3), [&s] { return !s.pending; })) {
+                LOG_WARN << "mDNS registration cancellation still pending";
+                return;
+            }
+        }
+        if (s.status != ERROR_SUCCESS) return;
+        s.deregistering = true;
+        s.pending = true;
+        s.request.pQueryContext = new std::shared_ptr<RegisteredService>(service);
+        lock.unlock();
+        DWORD rc = DnsServiceDeRegister(&s.request, nullptr);
+        lock.lock();
+        if (rc != DNS_REQUEST_PENDING) {
+            delete static_cast<std::shared_ptr<RegisteredService>*>(s.request.pQueryContext);
+            s.pending = false;
+            LOG_WARN << "DnsServiceDeRegister failed: " << rc;
+            return;
+        }
+        if (!s.cv.wait_for(lock, std::chrono::seconds(3), [&s] { return !s.pending; })) {
+            LOG_WARN << "mDNS deregistration still pending";
+        }
     }
 
     bool start(const ap::airplay::DeviceContext& ctx, uint16_t port) {
@@ -129,11 +176,11 @@ struct MdnsService::Impl {
         }
 
         // ---- _airplay._tcp --------------------------------------------------
-        airplay.host_name     = local_host;
-        airplay.instance_name = widen(ctx.name) + L"._airplay._tcp.local";
-        airplay.keys          = { L"deviceid", L"features", L"flags", L"model",
+        airplay->host_name     = local_host;
+        airplay->instance_name = widen(ctx.name) + L"._airplay._tcp.local";
+        airplay->keys          = { L"deviceid", L"features", L"flags", L"model",
                                   L"pi", L"pk", L"pw", L"srcvers", L"vv" };
-        airplay.values        = { widen(ctx.deviceid), widen(ctx.features),
+        airplay->values        = { widen(ctx.deviceid), widen(ctx.features),
                                   L"0x4",             widen(ctx.model),
                                   widen(ctx.pi),      pk_hex,
                                   L"false",           widen(ctx.srcvers),
@@ -146,13 +193,13 @@ struct MdnsService::Impl {
         for (char c : ctx.deviceid) if (c != ':') hex.push_back(c);
         std::string raop_name = hex + "@" + ctx.name;
 
-        raop.host_name     = local_host;
-        raop.instance_name = widen(raop_name) + L"._raop._tcp.local";
-        raop.keys          = { L"txtvers", L"ch",  L"cn",  L"da", L"et",
+        raop->host_name     = local_host;
+        raop->instance_name = widen(raop_name) + L"._raop._tcp.local";
+        raop->keys          = { L"txtvers", L"ch",  L"cn",  L"da", L"et",
                                L"ft",      L"md",  L"am",  L"rhd", L"pk",
                                L"pw",      L"sf",  L"sr",  L"ss",  L"sv",
                                L"tp",      L"vn",  L"vs",  L"vv" };
-        raop.values        = { L"1",                L"2",
+        raop->values        = { L"1",                L"2",
                                L"0,1,2,3",          L"true",
                                L"0,3,5",            widen(ctx.features),
                                L"0,1,2",            widen(ctx.model),
@@ -170,14 +217,8 @@ struct MdnsService::Impl {
     }
 
     void stop() {
-        if (airplay.active) {
-            DnsServiceRegisterCancel(&airplay.cancel);
-            airplay.active = false;
-        }
-        if (raop.active) {
-            DnsServiceRegisterCancel(&raop.cancel);
-            raop.active = false;
-        }
+        unregister_service(airplay);
+        unregister_service(raop);
     }
 };
 

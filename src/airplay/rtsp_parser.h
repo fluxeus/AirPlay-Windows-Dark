@@ -1,4 +1,6 @@
 #pragma once
+#include "net/socket.h"
+#include <memory>
 
 #include <cstddef>
 #include <string>
@@ -43,12 +45,15 @@ struct Response {
 // exactly Content-Length bytes (0 if no header).
 class RequestReader {
 public:
-    bool read(int fd, Request& out);
+    explicit RequestReader(std::shared_ptr<std::atomic<bool>> cancelled = {})
+        : cancelled_(std::move(cancelled)) {}
+    bool read(socket_t fd, Request& out);
 
 private:
+    std::shared_ptr<std::atomic<bool>> cancelled_;
     std::string buffer_;   // accumulated bytes across recv calls
-    bool fill(int fd, std::size_t need);
-    bool read_headers(int fd, Request& out, std::size_t& body_offset);
+    bool fill(socket_t fd, std::size_t need);
+    bool read_headers(socket_t fd, Request& out, std::size_t& body_offset);
 };
 
 } // namespace ap::airplay

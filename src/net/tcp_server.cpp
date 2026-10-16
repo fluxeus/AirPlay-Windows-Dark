@@ -10,6 +10,7 @@ TcpServer::~TcpServer() {
 }
 
 bool TcpServer::start(uint16_t port, Handler handler) {
+    if (running_) return false;
     handler_ = std::move(handler);
 
     // Dual-stack listener: an IPv6 socket with IPV6_V6ONLY=0 accepts
@@ -56,10 +57,23 @@ bool TcpServer::start(uint16_t port, Handler handler) {
         return false;
     }
 
-    port_    = port;
+    sockaddr_storage bound{};
+#if defined(_WIN32)
+    int bound_len = sizeof(bound);
+#else
+    socklen_t bound_len = sizeof(bound);
+#endif
+    if (::getsockname(listener_, reinterpret_cast<sockaddr*>(&bound), &bound_len) != 0) {
+        close_socket(listener_);
+        listener_ = INVALID_SOCK;
+        return false;
+    }
+    port_ = bound.ss_family == AF_INET6
+        ? ntohs(reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port)
+        : ntohs(reinterpret_cast<sockaddr_in*>(&bound)->sin_port);
     running_ = true;
     accept_thread_ = std::thread(&TcpServer::accept_loop, this);
-    LOG_INFO << "TCP server listening on [::]:" << port
+    LOG_INFO << "TCP server listening on [::]:" << port_
              << " (IPv4+IPv6)";
     return true;
 }
@@ -69,11 +83,13 @@ void TcpServer::stop() {
 
     // Closing the listener unblocks accept().
     close_socket(listener_);
-    listener_ = INVALID_SOCK;
 
     if (accept_thread_.joinable()) accept_thread_.join();
+    listener_ = INVALID_SOCK;
+    close_all_clients();
     for (auto& t : workers_) if (t.joinable()) t.join();
     workers_.clear();
+    port_ = 0;
 }
 
 void TcpServer::accept_loop() {
@@ -118,6 +134,13 @@ void TcpServer::accept_loop() {
             peer_port = ntohs(in4->sin_port);
         }
 
+#if defined(_WIN32)
+        DWORD send_timeout = 2000;
+#else
+        timeval send_timeout{2, 0};
+#endif
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+            reinterpret_cast<const char*>(&send_timeout), sizeof(send_timeout));
         ClientSocket client;
         client.fd   = fd;
         client.peer = peer_is_v6
@@ -128,20 +151,28 @@ void TcpServer::accept_loop() {
         const socket_t track_fd = client.fd;
         {
             std::lock_guard<std::mutex> lock(clients_mtx_);
-            active_clients_.insert(track_fd);
+            if (!running_ || disconnecting_) {
+                close_socket(track_fd);
+                continue;
+            }
+            active_clients_.emplace(track_fd, client.cancelled);
         }
         workers_.emplace_back([this, h = handler_, c = std::move(client),
                                track_fd]() mutable {
             h(std::move(c));
             std::lock_guard<std::mutex> lock(clients_mtx_);
+            close_socket(track_fd);
             active_clients_.erase(track_fd);
+            clients_cv_.notify_all();
         });
     }
 }
 
-void TcpServer::close_all_clients() {
-    std::lock_guard<std::mutex> lock(clients_mtx_);
-    for (socket_t fd : active_clients_) {
+void TcpServer::close_all_clients(const std::function<void()>& on_drained) {
+    std::unique_lock<std::mutex> lock(clients_mtx_);
+    disconnecting_ = true;
+    for (const auto& [fd, cancelled] : active_clients_) {
+        cancelled->store(true);
 #if defined(_WIN32)
         ::shutdown(fd, SD_BOTH);
 #else
@@ -150,9 +181,10 @@ void TcpServer::close_all_clients() {
     }
     LOG_INFO << "TCP server: shutdown " << active_clients_.size()
              << " active client(s) on user request";
-    // Don't erase entries here - the workers do it themselves once
-    // they exit, so we don't double-erase or race with concurrent
-    // cleanup paths.
+    // Workers erase entries only after the handler has stopped all media.
+    clients_cv_.wait(lock, [this] { return active_clients_.empty(); });
+    if (on_drained) on_drained();
+    disconnecting_ = false;
 }
 
 } // namespace ap::net

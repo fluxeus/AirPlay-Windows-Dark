@@ -303,9 +303,10 @@ void StreamSession::teardown() {
              << " mirror=" << (mirror_ ? "yes" : "no")
              << " audio=" << (audio_ ? "yes" : "no")
              << " channels=" << channels_.size();
-    if (ntp_)    { LOG_INFO << "teardown: ntp stop"; ntp_->stop(); ntp_.reset(); }
     if (mirror_) { LOG_INFO << "teardown: mirror stop"; mirror_->stop(); mirror_.reset(); }
     if (audio_)  { LOG_INFO << "teardown: audio stop"; audio_->stop();  audio_.reset(); }
+
+    if (ntp_)    { LOG_INFO << "teardown: ntp stop"; ntp_->stop(); ntp_.reset(); }
 
     LOG_INFO << "teardown: closing session sockets";
     for (auto* sp : { &data_sock_, &ctrl_sock_, &timing_sock_,

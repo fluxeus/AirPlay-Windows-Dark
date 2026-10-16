@@ -1,5 +1,7 @@
 #include "airplay/server.h"
 #include "airplay/client_session.h"
+#include "airplay/hls_session.h"
+#include "video/hls_player.h"
 #include "airplay/reverse_channel.h"
 #include "log.h"
 
@@ -16,8 +18,19 @@ void Server::stop() {
     tcp_.stop();
 }
 
+void Server::disconnect_clients() {
+    tcp_.close_all_clients([this] {
+        if (ctx_.hls_player) ctx_.hls_player->stop();
+        HlsSessionRegistry::instance().set_active_session("");
+        if (ctx_.renderer) {
+            ctx_.renderer->clear_session();
+            ctx_.renderer->clear_active_device();
+        }
+    });
+}
+
 void Server::handle_client(ap::net::ClientSocket client) {
-    RequestReader reader;
+    RequestReader reader(client.cancelled);
     Request req;
 
     // Peer is formatted by tcp_server as "ip:port" for v4 and v4-mapped,
@@ -40,8 +53,9 @@ void Server::handle_client(ap::net::ClientSocket client) {
                           ctx_.mirror_hwaccel);
     session.live = ctx_.live;
 
-    while (reader.read(static_cast<int>(client.fd), req)) {
+    while (reader.read(client.fd, req)) {
         Response res = dispatch(ctx_, session, req);
+        if (client.cancelled->load()) break;
         if (res.silent) continue;
         std::string wire = res.serialize();
         if (ap::net::send_all(client.fd, wire.data(),
@@ -54,8 +68,9 @@ void Server::handle_client(ap::net::ClientSocket client) {
         ReverseChannelRegistry::instance().unregister_socket(
             session.reverse_session_id);
     }
+    // Close the media transports before releasing the control connection.
+    session.streams.reset();
     LOG_INFO << "closing " << client.peer;
-    ap::net::close_socket(client.fd);
 }
 
 } // namespace ap::airplay

@@ -269,15 +269,10 @@ int main(int argc, char** argv) {
         ap::net::global_shutdown();
         return 1;
     }
-    // Wire the toolbar "Disconnect" button. Closing the RTSP TCP
-    // sockets cascades into the per-session cleanup that tears down
-    // mirror + audio without a process restart. We also wipe the
-    // renderer's session state directly because a forced TCP close
-    // doesn't go through the normal TEARDOWN path that would do it.
-    renderer.set_disconnect_handler([&server, &renderer]() {
-        server.disconnect_clients();
-        renderer.clear_session();
-        renderer.clear_active_device();
+    // Keep the render thread available while workers finish GPU/audio teardown.
+    std::atomic<bool> disconnect_requested{false};
+    renderer.set_disconnect_handler([&disconnect_requested]() {
+        disconnect_requested.store(true);
     });
 
     // Local HTTP proxy + libavformat player only when the HLS path is
@@ -308,18 +303,21 @@ int main(int argc, char** argv) {
 
     LOG_INFO << "Ready. Close the window or press Ctrl-C to exit.";
     while (!g_stop && !renderer.user_closed()) {
+        if (disconnect_requested.exchange(false)) server.disconnect_clients();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     LOG_INFO << "Shutting down... (g_stop=" << g_stop.load()
              << " user_closed=" << renderer.user_closed() << ")";
-    usb_supervisor.stop();
+    // Withdraw discovery and interrupt sessions before stopping peripherals.
     mdns.stop();
+    server.stop();
+    usb_supervisor.stop();
     hls_player.stop();
     hls_server.stop();
-    server.stop();
     ap::save_settings(ap::snapshot(live_settings));
     renderer.stop();
+    SDL_Quit();
     ap::net::global_shutdown();
     return 0;
 }

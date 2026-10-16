@@ -191,6 +191,7 @@ template <typename RunningFn>
 int recv_exact(socket_t s, unsigned char* buf, int len, RunningFn running) {
     int got = 0;
     while (got < len) {
+        if (!running()) return -1;
         int n = ::recv(s, reinterpret_cast<char*>(buf + got), len - got, 0);
         if (n > 0) { got += n; continue; }
         if (n == 0) return 0;                 // peer closed
@@ -311,11 +312,21 @@ bool MirrorListener::start(uint16_t& port) {
 
 void MirrorListener::stop() {
     if (!running_.exchange(false)) return;
-    if (listen_sock_ != INVALID_SOCK) {
-        ap::net::close_socket(listen_sock_);
-        listen_sock_ = INVALID_SOCK;
+    {
+        std::lock_guard<std::mutex> lock(client_mtx_);
+        if (client_sock_ != INVALID_SOCK) {
+#if defined(_WIN32)
+            ::shutdown(client_sock_, SD_BOTH);
+#else
+            ::shutdown(client_sock_, SHUT_RDWR);
+#endif
+        }
     }
+    // select() has a 100 ms timeout. Keep the listener valid until its
+    // thread exits rather than racing close()/descriptor reuse with select().
     if (thread_.joinable()) thread_.join();
+    ap::net::close_socket(listen_sock_);
+    listen_sock_ = INVALID_SOCK;
 }
 
 void MirrorListener::accept_loop() {
@@ -337,6 +348,14 @@ void MirrorListener::accept_loop() {
         socket_t client = ::accept(listen_sock_,
                                    reinterpret_cast<sockaddr*>(&peer), &plen);
         if (client == INVALID_SOCK) continue;
+        {
+            std::lock_guard<std::mutex> lock(client_mtx_);
+            if (!running_) {
+                ap::net::close_socket(client);
+                break;
+            }
+            client_sock_ = client;
+        }
 
         char ip[INET6_ADDRSTRLEN] = {0};
         uint16_t peer_port = 0;
@@ -361,7 +380,11 @@ void MirrorListener::accept_loop() {
 
         reader_loop(client);
 
-        ap::net::close_socket(client);
+        {
+            std::lock_guard<std::mutex> lock(client_mtx_);
+            ap::net::close_socket(client);
+            client_sock_ = INVALID_SOCK;
+        }
     }
 }
 

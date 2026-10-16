@@ -788,7 +788,7 @@ void VideoRenderer::run(const std::string& title) {
         LOG_ERROR << "SDL window/renderer create failed: " << SDL_GetError();
         if (renderer) SDL_DestroyRenderer(renderer);
         if (window)   SDL_DestroyWindow(window);
-        SDL_Quit();
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
         running_ = false;
         return;
     }
@@ -1612,8 +1612,7 @@ void VideoRenderer::run(const std::string& title) {
                 }
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip(
-                        "Drop the current AirPlay session "
-                        "(device may re-mirror immediately)");
+                        "End the current AirPlay session");
                 }
                 ImGui::SameLine();
             }
@@ -2190,7 +2189,7 @@ void VideoRenderer::run(const std::string& title) {
     ImGui::DestroyContext();
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
-    SDL_Quit();
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
     LOG_INFO << "VideoRenderer stopped";
 }
 

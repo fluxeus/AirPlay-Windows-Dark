@@ -45,6 +45,23 @@ void close_socket(socket_t s) {
 #endif
 }
 
+int recv_interruptible(socket_t s, void* buf, int len, const std::atomic<bool>* cancelled) {
+    // shutdown() alone need not cancel a pending synchronous Winsock recv.
+    // Poll readiness so cancellation is observed without closing/reusing a
+    // descriptor while its worker may still be reading it.
+    while (!cancelled || !cancelled->load()) {
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(s, &readable);
+        timeval timeout{0, 100000};
+        const int ready = ::select(static_cast<int>(s) + 1, &readable, nullptr, nullptr, &timeout);
+        if (cancelled && cancelled->load()) return -1;
+        if (ready < 0) return -1;
+        if (ready > 0) return ::recv(s, static_cast<char*>(buf), len, 0);
+    }
+    return -1;
+}
+
 int last_error() {
 #if defined(_WIN32)
     return WSAGetLastError();

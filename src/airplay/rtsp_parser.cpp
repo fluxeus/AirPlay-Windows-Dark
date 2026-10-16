@@ -54,17 +54,17 @@ std::string Response::serialize() const {
     return head;
 }
 
-bool RequestReader::fill(int fd, std::size_t need) {
+bool RequestReader::fill(socket_t fd, std::size_t need) {
     char tmp[4096];
     while (buffer_.size() < need) {
-        int n = ::recv(static_cast<::socket_t>(fd), tmp, sizeof(tmp), 0);
+        int n = ap::net::recv_interruptible(fd, tmp, sizeof(tmp), cancelled_.get());
         if (n <= 0) return false;
         buffer_.append(tmp, n);
     }
     return true;
 }
 
-bool RequestReader::read_headers(int fd, Request& out, std::size_t& body_offset) {
+bool RequestReader::read_headers(socket_t fd, Request& out, std::size_t& body_offset) {
     // Grow buffer_ until we see CRLFCRLF.
     char tmp[4096];
     while (true) {
@@ -73,7 +73,7 @@ bool RequestReader::read_headers(int fd, Request& out, std::size_t& body_offset)
             body_offset = pos + 4;
             break;
         }
-        int n = ::recv(static_cast<::socket_t>(fd), tmp, sizeof(tmp), 0);
+        int n = ap::net::recv_interruptible(fd, tmp, sizeof(tmp), cancelled_.get());
         if (n <= 0) return false;
         buffer_.append(tmp, n);
         if (buffer_.size() > 64 * 1024) {
@@ -119,8 +119,9 @@ bool RequestReader::read_headers(int fd, Request& out, std::size_t& body_offset)
     return true;
 }
 
-bool RequestReader::read(int fd, Request& out) {
+bool RequestReader::read(socket_t fd, Request& out) {
     out = {};
+    if (cancelled_ && cancelled_->load()) return false;
 
     std::size_t body_offset = 0;
     if (!read_headers(fd, out, body_offset)) return false;

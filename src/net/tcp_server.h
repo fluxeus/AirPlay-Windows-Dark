@@ -3,9 +3,11 @@
 #include "net/socket.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
-#include <set>
+#include <map>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -14,11 +16,12 @@ namespace ap::net {
 
 struct ClientSocket {
     socket_t fd = INVALID_SOCK;
+    std::shared_ptr<std::atomic<bool>> cancelled = std::make_shared<std::atomic<bool>>(false);
     std::string peer;   // "ip:port"
 };
 
 // Minimal blocking TCP server. Each accepted client runs on its own thread
-// calling `handler(client)`. The handler owns the socket and must close it.
+// calling `handler(client)`. The socket is borrowed; the server closes it after the handler returns.
 // Stop() joins all client threads and closes the listener.
 class TcpServer {
 public:
@@ -30,12 +33,12 @@ public:
     bool start(uint16_t port, Handler handler);
     void stop();
 
-    // Forcibly shutdown every currently-connected client socket. The
-    // handler thread sees recv() return 0 / error and tears down its
-    // session naturally. Listener stays up — new connections still
-    // accepted. Used by the "Disconnect" button to drop an active
-    // AirPlay session on demand.
-    void close_all_clients();
+    // Cancel active handlers and shut down their transports. Handlers must
+    // use recv_interruptible() (or otherwise observe client.cancelled).
+    // Wait for all session teardown before invoking on_drained. New clients
+    // are rejected until that callback completes. Call outside the render
+    // thread; stop()/close_all_clients() are serialized by the caller.
+    void close_all_clients(const std::function<void()>& on_drained = {});
 
     uint16_t port() const { return port_; }
 
@@ -49,10 +52,12 @@ private:
     std::vector<std::thread> workers_;
     Handler handler_;
 
-    // Tracked here so we can close() them on demand from another
-    // thread. Erased by the worker on exit.
+    // Workers close and erase under the same lock to prevent descriptor
+    // reuse from racing a concurrent disconnect request.
     std::mutex          clients_mtx_;
-    std::set<socket_t>  active_clients_;
+    std::condition_variable clients_cv_;
+    bool disconnecting_{false};
+    std::map<socket_t, std::shared_ptr<std::atomic<bool>>> active_clients_;
 };
 
 } // namespace ap::net

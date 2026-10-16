@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -66,6 +67,8 @@ private:
     socket_t          listen_sock_{INVALID_SOCK};
     std::atomic<bool> running_{false};
     std::thread       thread_;
+    std::mutex        client_mtx_;
+    socket_t          client_sock_{INVALID_SOCK};
 
     std::unique_ptr<ap::crypto::MirrorDecrypt> decrypt_;
     std::unique_ptr<ap::video::H264Decoder>    decoder_;

@@ -55,6 +55,7 @@ void Server::handle_client(ap::net::ClientSocket client) {
 
     while (reader.read(client.fd, req)) {
         Response res = dispatch(ctx_, session, req);
+        client.reset_on_disconnect->store(session.streams && session.streams->audio_only());
         if (client.cancelled->load()) break;
         if (res.silent) continue;
         std::string wire = res.serialize();

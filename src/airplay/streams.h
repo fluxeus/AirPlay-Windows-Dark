@@ -87,6 +87,8 @@ public:
 
     void teardown();
 
+    bool audio_only() const;
+
     const std::string& session_id() const { return session_id_; }
 
 private:

@@ -17,6 +17,9 @@ namespace ap::net {
 struct ClientSocket {
     socket_t fd = INVALID_SOCK;
     std::shared_ptr<std::atomic<bool>> cancelled = std::make_shared<std::atomic<bool>>(false);
+    // Audio-only senders can retain their output route after a control FIN.
+    // Request an explicit transport reset for receiver-initiated disconnect.
+    std::shared_ptr<std::atomic<bool>> reset_on_disconnect = std::make_shared<std::atomic<bool>>(false);
     std::string peer;   // "ip:port"
 };
 
@@ -57,7 +60,7 @@ private:
     std::mutex          clients_mtx_;
     std::condition_variable clients_cv_;
     bool disconnecting_{false};
-    std::map<socket_t, std::shared_ptr<std::atomic<bool>>> active_clients_;
+    std::map<socket_t, ClientSocket> active_clients_;
 };
 
 } // namespace ap::net

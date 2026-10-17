@@ -49,7 +49,11 @@ private:
     uint16_t port_{0};
     std::thread accept_thread_;
     std::atomic<bool> running_{false};
-    std::vector<std::thread> workers_;
+    struct Worker {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> finished;
+    };
+    std::vector<Worker> workers_;
     Handler handler_;
 
     // Workers close and erase under the same lock to prevent descriptor

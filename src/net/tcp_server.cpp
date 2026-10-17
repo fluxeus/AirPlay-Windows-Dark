@@ -87,7 +87,8 @@ void TcpServer::stop() {
     if (accept_thread_.joinable()) accept_thread_.join();
     listener_ = INVALID_SOCK;
     close_all_clients();
-    for (auto& t : workers_) if (t.joinable()) t.join();
+    for (auto& worker : workers_)
+        if (worker.thread.joinable()) worker.thread.join();
     workers_.clear();
     port_ = 0;
 }
@@ -157,15 +158,30 @@ void TcpServer::accept_loop() {
             }
             active_clients_.emplace(track_fd, client.cancelled);
         }
-        workers_.emplace_back([this, h = handler_, c = std::move(client),
-                               track_fd]() mutable {
+        // Only the accept thread touches this vector until stop() joins it.
+        // Reap completed workers as connections arrive, instead of retaining
+        // one native thread handle and its bookkeeping per connection forever.
+        for (auto it = workers_.begin(); it != workers_.end();) {
+            if (it->finished->load(std::memory_order_acquire)) {
+                it->thread.join();
+                it = workers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        auto finished = std::make_shared<std::atomic<bool>>(false);
+        workers_.push_back(Worker{std::thread([this, h = handler_, c = std::move(client),
+                               track_fd, finished]() mutable {
             h(std::move(c));
-            std::lock_guard<std::mutex> lock(clients_mtx_);
-            close_socket(track_fd);
-            LOG_INFO << "control socket closed fd=" << track_fd;
-            active_clients_.erase(track_fd);
-            clients_cv_.notify_all();
-        });
+            {
+                std::lock_guard<std::mutex> lock(clients_mtx_);
+                close_socket(track_fd);
+                LOG_INFO << "control socket closed fd=" << track_fd;
+                active_clients_.erase(track_fd);
+                clients_cv_.notify_all();
+            }
+            finished->store(true, std::memory_order_release);
+        }), finished});
     }
 }
 

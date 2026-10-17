@@ -49,10 +49,14 @@ jobs:
         run: |
           cmake -S . -B build `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DBUILD_NETWORK_TESTS=ON `
             -G "Visual Studio 18 2026" -A x64
 
       - name: Build Release
         run: cmake --build build --config Release --parallel
+
+      - name: Run socket lifecycle regression tests
+        run: ctest --test-dir build -C Release --output-on-failure
 
       # Python role-plays an iOS client for 6 scenarios (pair-verify
       # round-trip, real iOS headers, signature corruption, concurrent
@@ -79,6 +83,7 @@ jobs:
           $proc = Start-Process `
             -FilePath "build\Release\airplay-windows.exe" `
             -ArgumentList "--log" `
+            -WindowStyle Hidden `
             -PassThru `
             -RedirectStandardOutput "airplay.stdout.log" `
             -RedirectStandardError "airplay.stderr.log"

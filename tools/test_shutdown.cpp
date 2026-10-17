@@ -99,6 +99,22 @@ void test_control_shutdown() {
     }
     std::cout << "PASS: disconnect, EOF/reset, cleanup ordering, reconnect, active stop, restart (5 rounds)\n";
 }
+void test_completed_workers() {
+#if defined(_WIN32)
+    ap::net::TcpServer server;
+    require(server.start(0, [](ap::net::ClientSocket) {}), "worker recycling server");
+    DWORD before = 0, after = 0;
+    require(GetProcessHandleCount(GetCurrentProcess(), &before) != 0, "initial handle count");
+    for (int i = 0; i < 200; ++i) {
+        check_closed(connect_to(server.port()));
+        std::this_thread::sleep_for(1ms);
+    }
+    require(GetProcessHandleCount(GetCurrentProcess(), &after) != 0, "final handle count");
+    require(after <= before + 8, "completed connection thread handles stay bounded before server stop");
+    server.stop();
+    std::cout << "PASS: 200 short connections without accumulating completed thread handles\n";
+#endif
+}
 void test_blocked_send() {
     ap::net::TcpServer server;
     std::atomic<bool> sending{false}, completed{false};
@@ -224,6 +240,7 @@ int main(int argc, char** argv) {
     // Bound failures even when a regression blocks a worker join forever.
     std::thread([] { std::this_thread::sleep_for(20s); std::_Exit(2); }).detach();
     test_control_shutdown();
+    test_completed_workers();
     test_blocked_send();
     if (argc > 1 && std::string(argv[1]) == "--mdns") test_mdns();
 #if defined(_WIN32)

@@ -317,6 +317,7 @@ add_executable(airplay-windows
     src/airplay/ntp_client.cpp
     src/airplay/rtsp_parser.cpp
     src/airplay/sdp.cpp
+    src/airplay/dacp_remote.cpp
     src/airplay/server.cpp
     src/airplay/streams.cpp
     src/airplay/fcup.cpp
@@ -482,7 +483,7 @@ endif()
 # Focused regression tests for receiver disconnect and shutdown.
 option(BUILD_NETWORK_TESTS "Build socket shutdown regression tests" OFF)
 if(BUILD_NETWORK_TESTS)
-    add_executable(test-shutdown tools/test_shutdown.cpp src/airplay/rtsp_parser.cpp src/net/tcp_server.cpp
+    add_executable(test-shutdown tools/test_shutdown.cpp src/airplay/dacp_remote.cpp src/airplay/rtsp_parser.cpp src/net/tcp_server.cpp
         src/net/socket.cpp src/mdns/mdns_service.cpp src/log.cpp)
     target_include_directories(test-shutdown PRIVATE src)
     if(WIN32)

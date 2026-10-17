@@ -1,5 +1,6 @@
 #pragma once
 
+#include "airplay/media_control.h"
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -177,6 +178,13 @@ public:
     // Wire the toolbar "Disconnect" button. Invoked from the render
     // thread when the user clicks; should drop every connected
     // AirPlay client (typically Server::disconnect_clients).
+    void set_audio_control_handler(std::function<void(ap::airplay::MediaCommand, uint32_t)> handler);
+    void set_audio_control_available(bool available) { audio_control_available_.store(available); }
+    void audio_command_finished(bool success) {
+        audio_command_failed_.store(!success);
+        audio_command_pending_.store(false);
+    }
+
     void set_disconnect_handler(std::function<void()> h);
 
     // Set true when the user closes the window (SDL_QUIT). main() polls
@@ -296,6 +304,10 @@ private:
     // "Disconnect" click. Empty by default so missing wiring is
     // a silent no-op rather than a crash.
     std::function<void()>      disconnect_handler_;
+    std::function<void(ap::airplay::MediaCommand, uint32_t)> audio_control_handler_;
+    std::atomic<bool> audio_control_available_{false};
+    std::atomic<bool> audio_command_pending_{false};
+    std::atomic<bool> audio_command_failed_{false};
 
     // MP4 writer. Encoding runs on its own bounded worker queue so recording
     // cannot add latency to mirror decode/render.

@@ -483,6 +483,9 @@ bool VideoRenderer::in_flush_grace() const {
 
 void VideoRenderer::clear_session() {
     LOG_INFO << "VideoRenderer clear_session: reset cover / metadata / progress / video frame";
+    audio_control_available_.store(false);
+    audio_command_pending_.store(false);
+    audio_command_failed_.store(false);
     // Drop the last decoded frame so the stage falls back to the
     // idle "Waiting for AirPlay" screen instead of freezing on the
     // last picture from the disconnected device. Both producer slots
@@ -630,6 +633,11 @@ void VideoRenderer::clear_active_device() {
     std::lock_guard<std::mutex> lock(device_mtx_);
     has_device_ = false;
     device_     = {};
+}
+
+void VideoRenderer::set_audio_control_handler(
+        std::function<void(ap::airplay::MediaCommand, uint32_t)> handler) {
+    audio_control_handler_ = std::move(handler);
 }
 
 void VideoRenderer::set_disconnect_handler(std::function<void()> h) {
@@ -842,11 +850,9 @@ void VideoRenderer::run(const std::string& title) {
     SDL_Texture* title_tex     = nullptr; int title_w     = 0, title_h     = 0;
     SDL_Texture* artist_tex    = nullptr; int artist_w    = 0, artist_h    = 0;
     SDL_Texture* album_tex     = nullptr; int album_w     = 0, album_h     = 0;
-    SDL_Texture* progress_tex  = nullptr; int progress_w  = 0, progress_h  = 0;
     SDL_Texture* idle_name_tex = nullptr; int idle_name_w = 0, idle_name_h = 0;
     SDL_Texture* idle_ip_tex   = nullptr; int idle_ip_w   = 0, idle_ip_h   = 0;
     SDL_Texture* idle_msg_tex  = nullptr; int idle_msg_w  = 0, idle_msg_h  = 0;
-    std::string  last_progress_text;
 
     auto make_text = [&](const std::vector<TTF_Font*>& fonts,
                          const std::string& s, SDL_Color c,
@@ -1337,7 +1343,7 @@ void VideoRenderer::run(const std::string& title) {
         DeviceInfo active_dev;
         const bool has_active_dev = active_device_snapshot(active_dev);
         const bool show_video =
-            video_tex && (video_fresh || has_active_dev || !playing_now);
+            video_tex && active_dev.kind != "Audio" && (video_fresh || has_active_dev || !playing_now);
 
         int win_w = 0, win_h = 0;
         SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
@@ -1426,7 +1432,7 @@ void VideoRenderer::run(const std::string& title) {
         } else if (cover_tex) {
             // Cover art centered in the top 70% of the window; the bottom
             // strip holds the metadata text (title / artist / album).
-            const int strip_h = win_h / 4;
+            const int strip_h = std::min(win_h, std::max(win_h / 4, 230));
             const int top_h   = win_h - strip_h;
             SDL_Rect dst = fit_inside(cover_tex_w, cover_tex_h, win_w, top_h);
             SDL_RenderCopy(renderer, cover_tex, nullptr, &dst);
@@ -1453,52 +1459,7 @@ void VideoRenderer::run(const std::string& title) {
             draw_text(artist_tex, artist_w, artist_h);
             draw_text(album_tex,  album_w,  album_h);
 
-            // Progress row: "M:SS / M:SS" + thin bar. Only when the sender
-            // reported a non-zero track length (otherwise a zero total would
-            // hide the bar anyway, and dividing by zero would crash).
-            // iOS only sends progress: at transitions, so extrapolate with
-            // the wall clock since the last push (unless paused).
-            const uint32_t total_ms        = progress_total_ms_.load(std::memory_order_relaxed);
-            const uint32_t elapsed_pushed  = progress_elapsed_ms_.load(std::memory_order_relaxed);
-            const int64_t  pushed_at_ns    = progress_pushed_at_ns_.load(std::memory_order_relaxed);
-            const bool     playing         = playing_now;
-            uint32_t elapsed_ms = elapsed_pushed;
-            if (total_ms > 0 && playing && pushed_at_ns > 0) {
-                const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
-                const int64_t delta_ms = (now_ns - pushed_at_ns) / 1'000'000;
-                if (delta_ms > 0) {
-                    uint64_t extrapolated = static_cast<uint64_t>(elapsed_pushed) + delta_ms;
-                    if (extrapolated > total_ms) extrapolated = total_ms;
-                    elapsed_ms = static_cast<uint32_t>(extrapolated);
-                }
-            }
-            if (total_ms > 0) {
-                auto fmt = [](uint32_t ms) {
-                    const uint32_t s = ms / 1000;
-                    char buf[16];
-                    std::snprintf(buf, sizeof(buf), "%u:%02u", s / 60, s % 60);
-                    return std::string(buf);
-                };
-                std::string txt = fmt(elapsed_ms) + " / " + fmt(total_ms);
-                if (txt != last_progress_text || !progress_tex) {
-                    make_text(fonts_small, txt, SDL_Color{200, 200, 200, 255},
-                              progress_tex, progress_w, progress_h);
-                    last_progress_text = std::move(txt);
-                }
-                draw_text(progress_tex, progress_w, progress_h);
 
-                const int bar_h = 4;
-                const int bar_w = win_w - 2 * pad_x;
-                SDL_Rect bg{pad_x, y_pos + 2, bar_w, bar_h};
-                SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
-                SDL_RenderFillRect(renderer, &bg);
-                const double frac =
-                    std::min(1.0, static_cast<double>(elapsed_ms) / total_ms);
-                SDL_Rect fg{pad_x, y_pos + 2, static_cast<int>(bar_w * frac), bar_h};
-                SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255);
-                SDL_RenderFillRect(renderer, &fg);
-            }
         } else {
             // Idle: no mirror frame, no cover — show device info.
             auto draw_centered = [&](SDL_Texture* tex, int tw, int th, int y) {
@@ -2108,6 +2069,57 @@ void VideoRenderer::run(const std::string& title) {
         ImGui::PopStyleVar();
         } // !fullscreen
 
+        // Audio controls stay on the render thread; network work is queued
+        // to main(). Only received sender state drives play/time indicators.
+        if (has_active_dev && active_dev.kind == "Audio" && audio_control_handler_ && stage_w > 120 && stage_h > 100) {
+            constexpr float controls_h = 112.0f;
+            ImGui::SetNextWindowPos(ImVec2(static_cast<float>(stage_x),
+                static_cast<float>(stage_y + stage_h) - controls_h));
+            ImGui::SetNextWindowSize(ImVec2(static_cast<float>(stage_w), controls_h));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20, 8));
+            if (ImGui::Begin("##audio_controls", nullptr, kPanelFlags | ImGuiWindowFlags_NoScrollbar)) {
+                const bool ready = audio_control_available_.load();
+                const bool pending = audio_command_pending_.load();
+                auto command = [&](ap::airplay::MediaCommand action, uint32_t position = 0) {
+                    audio_command_failed_.store(false);
+                    audio_command_pending_.store(true);
+                    audio_control_handler_(action, position);
+                };
+                ImGui::BeginDisabled(!ready || pending);
+                if (ImGui::Button("Previous")) command(ap::airplay::MediaCommand::Previous);
+                ImGui::SameLine();
+                if (ImGui::Button(playing_now ? "Pause" : "Play", ImVec2(68, 0)))
+                    command(ap::airplay::MediaCommand::PlayPause);
+                ImGui::SameLine();
+                if (ImGui::Button("Next")) command(ap::airplay::MediaCommand::Next);
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (pending) ImGui::TextDisabled("Sending...");
+                else if (!ready) ImGui::TextDisabled("Remote control unavailable");
+                else if (audio_command_failed_.load()) ImGui::TextDisabled("Command failed or unsupported");
+
+                const uint32_t total = progress_total_ms_.load();
+                uint64_t elapsed = progress_elapsed_ms_.load();
+                const int64_t pushed = progress_pushed_at_ns_.load();
+                if (playing_now && pushed > 0) {
+                    const auto clock_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    if (clock_ns > pushed) elapsed += (clock_ns - pushed) / 1000000;
+                }
+                elapsed = total > 0 ? std::min<uint64_t>(elapsed, total) : 0;
+                // The tested iOS sender rejects absolute DACP seek (HTTP 400).
+                // Keep truthful progress rather than an actionable slider that fails.
+                const float progress = total > 0 ? static_cast<float>(elapsed) / total : 0.0f;
+                ImGui::ProgressBar(progress, ImVec2(-1, 8), "");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Playback position (read-only)");
+                const uint32_t display = static_cast<uint32_t>(elapsed);
+                ImGui::Text("%u:%02u / %u:%02u", display / 60000, (display / 1000) % 60,
+                    total / 60000, (total / 1000) % 60);
+            }
+            ImGui::End();
+            ImGui::PopStyleVar();
+        }
+
         // Pulsing "Waiting for AirPlay" ring centered in the stage when
         // no fresh video frame is on screen. Drawn to the background
         // list so the side panels still cover it where they overlap.
@@ -2174,7 +2186,6 @@ void VideoRenderer::run(const std::string& title) {
     if (title_tex)     SDL_DestroyTexture(title_tex);
     if (artist_tex)    SDL_DestroyTexture(artist_tex);
     if (album_tex)     SDL_DestroyTexture(album_tex);
-    if (progress_tex)  SDL_DestroyTexture(progress_tex);
     if (idle_name_tex) SDL_DestroyTexture(idle_name_tex);
     if (idle_ip_tex)   SDL_DestroyTexture(idle_ip_tex);
     if (idle_msg_tex)  SDL_DestroyTexture(idle_msg_tex);

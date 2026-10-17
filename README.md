@@ -214,6 +214,13 @@ The `/fp-setup` reply data and playfair implementation are bundled in
 GStreamer is optional: CMake's `USE_GSTREAMER_HLS=AUTO` uses it when found and
 otherwise selects libavformat. Use `ON` to require it or `OFF` to disable it.
 
+## Audio playback controls
+
+Audio-only sessions expose Play/Pause, Previous and Next when the sender's DACP
+service is available. These controls were validated with an iPhone. Progress
+is read-only: the tested iOS sender rejects absolute seek requests with HTTP 400,
+including the POST variant. No Bonjour installation is required on Windows.
+
 ## Tests
 
 The protocol suite simulates a sender for pairing, corrupted-signature handling,
@@ -227,6 +234,8 @@ python tools/test_pair_verify.py
 
 Socket shutdown regression tests are available with `-DBUILD_NETWORK_TESTS=ON`.
 Build Release and run `ctest --test-dir build -C Release --output-on-failure`.
+On Windows, `build/Release/test-shutdown.exe --dacp` tests native DACP discovery,
+playback commands, seek units, HTTP failures and stale-session rejection.
 On Windows, `build/Release/test-shutdown.exe --mdns` also exercises real DNS-SD
 registration/deregistration; inspect the callback status logs. These checks do
 not validate the mirroring indicator on an actual iOS device.

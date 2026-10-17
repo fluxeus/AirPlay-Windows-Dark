@@ -1,4 +1,9 @@
 #include "net/tcp_server.h"
+#include "airplay/dacp_remote.h"
+#if defined(_WIN32)
+#include <windows.h>
+#include <windns.h>
+#endif
 #include "airplay/rtsp_parser.h"
 #include "mdns/mdns_service.h"
 #include "log.h"
@@ -113,6 +118,91 @@ void test_blocked_send() {
     ap::net::close_socket(client);
     std::cout << "PASS: stop interrupts blocked send\n";
 }
+#if defined(_WIN32)
+struct DnsCompletion {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done{false};
+    DWORD status{ERROR_SUCCESS};
+    static void WINAPI callback(DWORD status, PVOID ctx, PDNS_SERVICE_INSTANCE instance) {
+        auto* self = static_cast<DnsCompletion*>(ctx);
+        if (instance) DnsServiceFreeInstance(instance);
+        std::lock_guard<std::mutex> lock(self->mutex);
+        self->status = status;
+        self->done = true;
+        self->cv.notify_all();
+    }
+    void wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        require(cv.wait_for(lock, 5s, [&] { return done; }), "DNS callback timeout");
+        require(status == ERROR_SUCCESS, "DNS callback succeeds");
+    }
+};
+void test_dacp() {
+    ap::net::TcpServer sender;
+    std::atomic<int> requests{0};
+    const std::vector<std::string> expected = {"playpause", "previtem", "nextitem",
+        "setproperty?dacp.playingtime=12345", "setproperty?dacp.playingtime=999"};
+    require(sender.start(0, [&](ap::net::ClientSocket client) {
+        ap::airplay::RequestReader reader(client.cancelled);
+        ap::airplay::Request request;
+        require(reader.read(client.fd, request), "DACP request read");
+        const int index = requests.load();
+        require(index < static_cast<int>(expected.size()), "no duplicate media requests");
+        require(request.uri == "/ctrl-int/1/" + expected[index], "media command and seek milliseconds");
+        require(request.method == (index >= 3 ? "POST" : "GET"), "POST for seek, GET for transport controls");
+        require(request.header("content-length") == "0", "empty request body is framed");
+        require(request.header("active-remote") == "123456789", "DACP authenticated with sender token");
+        ++requests;
+        ap::net::send_all(client.fd, "HTTP/1.1 ", 9);
+        std::this_thread::sleep_for(10ms);
+        const std::string reply = std::string(index == 4 ? "403 Forbidden" : "204 No Content") +
+            "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        ap::net::send_all(client.fd, reply.data(), static_cast<int>(reply.size()));
+    }), "DACP sender start");
+    std::wstring instance_name = L"iTunes_Ctrl_AA01020304050607._dacp._tcp.local";
+    wchar_t host[256]; DWORD size = 256;
+    require(GetComputerNameExW(ComputerNamePhysicalDnsHostname, host, &size), "DNS hostname");
+    std::wstring host_name = std::wstring(host) + L".local";
+    DNS_SERVICE_INSTANCE instance{};
+    instance.pszInstanceName = instance_name.data();
+    instance.pszHostName = host_name.data();
+    instance.wPort = sender.port();
+    DnsCompletion registered, deregistered;
+    DNS_SERVICE_REGISTER_REQUEST dns{};
+    dns.Version = DNS_QUERY_REQUEST_VERSION1;
+    dns.pServiceInstance = &instance;
+    dns.pRegisterCompletionCallback = &DnsCompletion::callback;
+    dns.pQueryContext = &registered;
+    DNS_SERVICE_CANCEL cancel{};
+    require(DnsServiceRegister(&dns, &cancel) == DNS_REQUEST_PENDING, "register fake DACP service");
+    registered.wait();
+    {
+        ap::airplay::DacpRemote remote("127.0.0.1");
+        remote.update("AA01020304050607", "123456789", false);
+        using ap::airplay::MediaCommand;
+        require(!remote.send(MediaCommand::PlayPause), "mirror sessions do not send audio commands");
+        std::this_thread::sleep_for(1s);
+        remote.update("AA01020304050607", "123456789", true, "test-session");
+        require(remote.send(MediaCommand::PlayPause, 0, "test-session"), "play/pause command");
+        require(remote.available("test-session"), "audio control availability");
+        require(remote.send(MediaCommand::Previous, 0, "test-session"), "previous command");
+        require(remote.send(MediaCommand::Next, 0, "test-session"), "next command");
+        require(remote.send(MediaCommand::Seek, 12345, "test-session"), "seek is sent in milliseconds");
+        require(!remote.send(MediaCommand::Seek, 999, "test-session"), "HTTP rejection reports failure");
+        require(!remote.send(MediaCommand::Next, 0, "stale-session"), "stale session command rejected");
+        require(requests == 5, "one request per action; none for stale session");
+        remote.update("AA01020304050607", "bad\r\nInjected: true", true, "test-session");
+        require(!remote.send(MediaCommand::Next), "invalid token never sent");
+        require(requests == 5, "no request for invalid credentials");
+    }
+    dns.pQueryContext = &deregistered;
+    require(DnsServiceDeRegister(&dns, nullptr) == DNS_REQUEST_PENDING, "deregister fake DACP service");
+    deregistered.wait();
+    sender.stop();
+    std::cout << "PASS: native DACP discovery, media commands/auth, seek units, fragmented response, HTTP rejection, session/mirror gating\n";
+}
+#endif
 void test_mdns() {
     ap::airplay::DeviceContext context;
     context.name = "AirPlay shutdown regression test";
@@ -128,14 +218,17 @@ void test_mdns() {
     std::cout << "PASS: mDNS register/deregister and repeated stop (check DNS callback statuses above)\n";
 }
 }
-int main(int argc, char**) {
+int main(int argc, char** argv) {
     require(ap::net::global_init(), "Winsock");
     ap::set_log_enabled(true);
     // Bound failures even when a regression blocks a worker join forever.
     std::thread([] { std::this_thread::sleep_for(20s); std::_Exit(2); }).detach();
     test_control_shutdown();
     test_blocked_send();
-    if (argc > 1) test_mdns();
+    if (argc > 1 && std::string(argv[1]) == "--mdns") test_mdns();
+#if defined(_WIN32)
+    if (argc > 1 && std::string(argv[1]) == "--dacp") test_dacp();
+#endif
     ap::net::global_shutdown();
     return 0;
 }

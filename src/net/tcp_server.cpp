@@ -162,6 +162,7 @@ void TcpServer::accept_loop() {
             h(std::move(c));
             std::lock_guard<std::mutex> lock(clients_mtx_);
             close_socket(track_fd);
+            LOG_INFO << "control socket closed fd=" << track_fd;
             active_clients_.erase(track_fd);
             clients_cv_.notify_all();
         });

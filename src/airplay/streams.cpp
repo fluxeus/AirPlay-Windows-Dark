@@ -297,6 +297,13 @@ void StreamSession::set_audio_volume_db(float db) {
     if (audio_) audio_->set_volume_db(db);
 }
 
+bool StreamSession::audio_only() const {
+    if (mirror_) return false;
+    if (audio_) return true;
+    for (const auto& channel : channels_) if (channel.type == 96) return true;
+    return false;
+}
+
 void StreamSession::teardown() {
     LOG_INFO << "StreamSession::teardown begin session=" << session_id_
              << " ntp=" << (ntp_ ? "yes" : "no")

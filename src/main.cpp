@@ -24,6 +24,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <optional>
+#include <mutex>
 #include <csignal>
 #include <string>
 #include <thread>
@@ -90,7 +92,9 @@ int main(int argc, char** argv) {
     // default. With --log, attach to the parent terminal if we were
     // launched from one (cmd, powershell, terminal); otherwise spawn
     // a fresh console window so the user sees the stderr stream.
-    if (ap::is_log_enabled()) {
+    const DWORD log_handle_type = GetFileType(GetStdHandle(STD_ERROR_HANDLE));
+    const bool log_redirected = log_handle_type == FILE_TYPE_DISK || log_handle_type == FILE_TYPE_PIPE;
+    if (ap::is_log_enabled() && !log_redirected) {
         if (!AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
         FILE* dummy = nullptr;
         freopen_s(&dummy, "CONOUT$", "w", stdout);
@@ -275,6 +279,16 @@ int main(int argc, char** argv) {
         disconnect_requested.store(true);
     });
 
+    struct AudioRequest { ap::airplay::MediaCommand command; uint32_t position; std::string session_id; };
+    std::mutex audio_request_mutex;
+    std::optional<AudioRequest> audio_request;
+    renderer.set_audio_control_handler([&](ap::airplay::MediaCommand command, uint32_t position) {
+        ap::video::VideoRenderer::DeviceInfo device;
+        renderer.active_device_snapshot(device);
+        std::lock_guard<std::mutex> lock(audio_request_mutex);
+        audio_request = AudioRequest{command, position, device.session_id};
+    });
+
     // Local HTTP proxy + libavformat player only when the HLS path is
     // opted into. In the default (mirror + RAOP) mode nothing connects
     // to them anyway, but skipping the bind avoids the port claim and
@@ -303,15 +317,31 @@ int main(int argc, char** argv) {
 
     LOG_INFO << "Ready. Close the window or press Ctrl-C to exit.";
     while (!g_stop && !renderer.user_closed()) {
-        if (disconnect_requested.exchange(false)) server.disconnect_clients();
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (disconnect_requested.exchange(false)) {
+            LOG_INFO << "Disconnect requested by toolbar";
+            server.disconnect_clients();
+            LOG_INFO << "Disconnect completed: all client handlers drained";
+        }
+        std::optional<AudioRequest> request;
+        {
+            std::lock_guard<std::mutex> lock(audio_request_mutex);
+            request.swap(audio_request);
+        }
+        if (request) {
+            const bool success = server.control_audio(request->command, request->position, request->session_id);
+            renderer.audio_command_finished(success);
+        }
+        ap::video::VideoRenderer::DeviceInfo current_device;
+        renderer.active_device_snapshot(current_device);
+        renderer.set_audio_control_available(server.audio_control_available(current_device.session_id));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     LOG_INFO << "Shutting down... (g_stop=" << g_stop.load()
              << " user_closed=" << renderer.user_closed() << ")";
     // Withdraw discovery and interrupt sessions before stopping peripherals.
-    mdns.stop();
     server.stop();
+    mdns.stop();
     usb_supervisor.stop();
     hls_player.stop();
     hls_server.stop();

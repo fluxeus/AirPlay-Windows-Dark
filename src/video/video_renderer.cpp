@@ -1,6 +1,7 @@
 #include "video/video_renderer.h"
 #include "video/video_recorder.h"
 #include "video/gpu_video.h"
+#include "video/cover_art.h"
 #include "airplay/live_settings.h"
 #include "airplay/receiver_name.h"
 #include "log.h"
@@ -210,47 +211,6 @@ SDL_HitTestResult SDLCALL hit_test_cb(SDL_Window* w,
     return SDL_HITTEST_NORMAL;
 }
 
-// Decode a JPEG blob via libavcodec's MJPEG decoder and repack as
-// tightly-packed RGB24. Returns width/height through output params.
-// `out_rgb` is sized w*h*3 on success.
-bool decode_jpeg_to_rgb(const uint8_t* jpeg, std::size_t size,
-                        int& w, int& h, std::vector<uint8_t>& out_rgb) {
-    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
-    if (!codec) return false;
-    AVCodecContext* ctx = avcodec_alloc_context3(codec);
-    AVPacket*       pkt = av_packet_alloc();
-    AVFrame*        fr  = av_frame_alloc();
-    bool ok = ctx && pkt && fr &&
-              avcodec_open2(ctx, codec, nullptr) == 0;
-    if (ok) {
-        pkt->data = const_cast<uint8_t*>(jpeg);
-        pkt->size = static_cast<int>(size);
-        ok = avcodec_send_packet(ctx, pkt)  == 0
-          && avcodec_receive_frame(ctx, fr) == 0;
-    }
-    if (ok) {
-        w = fr->width;
-        h = fr->height;
-        out_rgb.assign(static_cast<std::size_t>(w) * h * 3, 0);
-
-        SwsContext* sws = sws_getContext(
-            w, h, static_cast<AVPixelFormat>(fr->format),
-            w, h, AV_PIX_FMT_RGB24,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (sws) {
-            uint8_t* dst[1]        = { out_rgb.data() };
-            int      dst_stride[1] = { w * 3 };
-            sws_scale(sws, fr->data, fr->linesize, 0, h, dst, dst_stride);
-            sws_freeContext(sws);
-        } else {
-            ok = false;
-        }
-    }
-    if (fr)  av_frame_free(&fr);
-    if (pkt) av_packet_free(&pkt);
-    if (ctx) avcodec_free_context(&ctx);
-    return ok;
-}
 
 // Open every font in a priority list so we can fall back per codepoint.
 // Primary fonts cover Latin / Cyrillic / Greek (Segoe UI, DejaVu Sans…);
@@ -1330,7 +1290,7 @@ void VideoRenderer::run(const std::string& title) {
         if (!pending_cover.empty()) {
             int cw = 0, ch = 0;
             std::vector<uint8_t> rgb;
-            if (decode_jpeg_to_rgb(pending_cover.data(), pending_cover.size(),
+            if (decode_cover_art(pending_cover.data(), pending_cover.size(),
                                    cw, ch, rgb)) {
                 if (!cover_tex || cover_tex_w != cw || cover_tex_h != ch) {
                     if (cover_tex) SDL_DestroyTexture(cover_tex);

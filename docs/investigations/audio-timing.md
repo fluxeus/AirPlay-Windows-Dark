@@ -37,5 +37,6 @@ The socket lifecycle suite and all 26 protocol checks also passed locally.
 This validates scheduling, not audible lip sync on a physical iPhone. The local
 build logs `Audio synchronized playout: initial_wait_ms=...` and
 `Audio playout: synchronized=...` to check whether real sender anchors are used.
-An iPhone test with audio-only routing and video on the phone is still needed.
+The user subsequently confirmed aligned PC audio and iPhone video in audio-only
+mode. A real sender log showed an initial scheduled wait of about 1,745 ms.
 This experiment is separate from the published v0.3.0 tag.

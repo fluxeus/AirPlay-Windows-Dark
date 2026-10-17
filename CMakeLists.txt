@@ -331,6 +331,7 @@ add_executable(airplay-windows
     src/video/video_recorder.cpp
     ${HLS_PLAYER_SRC}
     src/video/video_renderer.cpp
+    src/video/cover_art.cpp
     src/audio/audio_receiver.cpp
     src/audio/aac_decoder.cpp
     src/audio/audio_output.cpp
@@ -483,6 +484,9 @@ endif()
 # Focused regression tests for receiver disconnect and shutdown.
 option(BUILD_NETWORK_TESTS "Build socket shutdown regression tests" OFF)
 if(BUILD_NETWORK_TESTS)
+    add_executable(test-cover-art tools/test_cover_art.cpp src/video/cover_art.cpp)
+    target_include_directories(test-cover-art PRIVATE src ${FFMPEG_INCLUDE_DIRS_OK})
+    target_link_libraries(test-cover-art PRIVATE ${FFMPEG_TARGETS})
     add_executable(test-audio-timing tools/test_audio_timing.cpp src/airplay/ntp_client.cpp
         src/audio/audio_receiver.cpp src/audio/aac_decoder.cpp src/audio/audio_output.cpp src/net/socket.cpp)
     target_include_directories(test-audio-timing PRIVATE src ${FFMPEG_INCLUDE_DIRS_OK})
@@ -502,6 +506,7 @@ if(BUILD_NETWORK_TESTS)
     enable_testing()
     add_test(NAME socket-shutdown COMMAND test-shutdown)
     add_test(NAME audio-timing COMMAND test-audio-timing)
+    add_test(NAME cover-art COMMAND test-cover-art)
     set_tests_properties(audio-timing PROPERTIES TIMEOUT 20)
     set_tests_properties(socket-shutdown PROPERTIES TIMEOUT 25)
 endif()

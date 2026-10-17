@@ -9,6 +9,7 @@
 #include "airplay/reverse_channel.h"
 #include "airplay/sdp.h"
 #include "airplay/streams.h"
+#include "audio/rtp_flush.h"
 #include "crypto/fairplay.h"
 #include "crypto/pair_verify.h"
 #include "log.h"
@@ -666,6 +667,7 @@ Response handle_set_parameter(ClientSession& session, const Request& req) {
                 }
                 session.last_progress_start = start;
                 session.last_progress_curr  = curr;
+                LOG_INFO << "Audio progress RTP: " << start << '/' << curr << '/' << end;
 
                 LOG_INFO << "playback " << (elapsed_ms / 1000) << "s / "
                          << (total_ms / 1000) << "s";
@@ -1485,7 +1487,9 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     // FLUSH only shows pause for a fraction of a frame.
     if (req.method == "FLUSH" || req.method == "PAUSE") {
         LOG_INFO << req.method << ": tentative pause";
-        if (session.streams) session.streams->flush_audio();
+        const auto rtp_info = req.header("rtp-info");
+        LOG_INFO << "FLUSH RTP-Info: " << rtp_info.substr(0, 128);
+        if (session.streams) session.streams->flush_audio(ap::audio::flush_timestamp(rtp_info));
         if (session.renderer) {
             session.renderer->note_flush();
             session.renderer->push_playback_rate(0.0f);

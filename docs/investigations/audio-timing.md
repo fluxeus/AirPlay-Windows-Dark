@@ -40,3 +40,22 @@ build logs `Audio synchronized playout: initial_wait_ms=...` and
 The user subsequently confirmed aligned PC audio and iPhone video in audio-only
 mode. A real sender log showed an initial scheduled wait of about 1,745 ms.
 This experiment is separate from the published v0.3.0 tag.
+
+## Pause/resume follow-up
+
+The initial scheduler could fill SDL with the sender's entire lead (about
+1.75 seconds in the real session). FLUSH then discarded that entire playback
+queue and all pending decoded PCM, ignoring the sender's `RTP-Info` boundary.
+The user reported a short missing segment when resuming.
+
+The follow-up limits SDL lookahead to roughly 60 ms including the estimated
+device buffer. Future PCM stays in the timestamped application queue. FLUSH
+with `rtptime` now removes only samples preceding that boundary, including
+partial PCM blocks and RTP rollover. Without a valid boundary it retains the
+previous full-reset behavior. The handling follows the timestamped flush
+semantics in [Shairport Sync's player](https://github.com/mikebrady/shairport-sync/blob/master/player.c).
+This does not infer that every FLUSH is a user pause or rebase the sender clock.
+
+Tests cover partial-block retention and full resets alongside synchronized
+playback. Logs include FLUSH boundaries and exact RTP progress for validation
+of the real iPhone pause/resume behavior, which still requires a physical test.

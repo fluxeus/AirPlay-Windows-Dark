@@ -2,6 +2,7 @@
 #include "airplay/ntp_clock.h"
 #include "airplay/ntp_client.h"
 #include "audio/audio_receiver.h"
+#include "audio/rtp_flush.h"
 #include "video/video_renderer.h"
 #include "log.h"
 #include <SDL.h>
@@ -91,6 +92,17 @@ std::vector<unsigned char> fixture() {
     return result;
 }
 void clock_tests() {
+    using ap::audio::flush_timestamp;
+    require(flush_timestamp("seq=65535;rtptime=0") == 0, "FLUSH accepts RTP zero");
+    require(flush_timestamp(" rtptime=4294967295 ;seq=1") == 0xffffffffU, "FLUSH maximum RTP timestamp");
+    require(!flush_timestamp("rtptime=-1") && !flush_timestamp("rtptime=4294967296") &&
+            !flush_timestamp("rtptime=42junk"), "Reject invalid FLUSH boundaries");
+    uint32_t position = 0xfffffffeU;
+    std::vector<int16_t> pcm{1,1,2,2,3,3,4,4};
+    require(ap::audio::trim_before(position, pcm, 0) == 4 && position == 0 && pcm.front() == 3,
+            "Partial PCM FLUSH across RTP rollover preserves the next sample");
+    require(ap::audio::trim_before(position, pcm, 0xffffffffU) == 0 && pcm.size() == 4,
+            "An expired FLUSH preserves future PCM");
     using ap::airplay::NtpClock;
     NtpClock clock;
     const auto r = (400000ULL << 32);
@@ -163,13 +175,16 @@ int main() {
         const auto elapsed_ms = (first_played - start) / 1'000'000;
         require(elapsed_ms >= 2800 && elapsed_ms <= 3200, "Playback follows three-second RTP/NTP deadline");
         std::printf("PASS: audio arriving 3s early submitted at %lld ms\n", static_cast<long long>(elapsed_ms));
-        send_audio(2, 22345678, 1); std::this_thread::sleep_for(100ms); receiver.flush();
+        send_audio(2, 22345678, 1); std::this_thread::sleep_for(100ms); receiver.flush(22345778);
         std::this_thread::sleep_for(1200ms);
-        require(played == 1, "FLUSH cancels scheduled PCM");
-        receiver.set_synchronized(false); send_audio(3, 32345678, 3);
-        for (int i = 0; i < 50 && played == 1; ++i) std::this_thread::sleep_for(10ms);
-        require(played == 2, "Mirroring retains immediate audio submission");
-        receiver.set_synchronized(true); send_audio(4, 42345678, 4);
+        require(played == 2, "RTP FLUSH retains future PCM instead of losing the entire block");
+        send_audio(3, 22355678, 1); std::this_thread::sleep_for(100ms); receiver.flush();
+        std::this_thread::sleep_for(1200ms);
+        require(played == 2, "FLUSH without a boundary cancels all scheduled PCM");
+        receiver.set_synchronized(false); send_audio(4, 32345678, 3);
+        for (int i = 0; i < 50 && played == 2; ++i) std::this_thread::sleep_for(10ms);
+        require(played == 3, "Mirroring retains immediate audio submission");
+        receiver.set_synchronized(true); send_audio(5, 42345678, 4);
         const auto stopped = Clock::now(); receiver.stop();
         require(Clock::now() - stopped < 500ms, "Stop interrupts a future scheduled frame");
         ntp.stop();

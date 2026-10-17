@@ -1,5 +1,6 @@
 #include "audio/audio_receiver.h"
 #include "airplay/ntp_client.h"
+#include "audio/rtp_flush.h"
 #include "log.h"
 #include "video/video_renderer.h"
 
@@ -128,11 +129,24 @@ void AudioReceiver::set_volume_db(float db) {
     if (output_) output_->set_volume_db(db);
 }
 
-void AudioReceiver::flush() {
+void AudioReceiver::flush(std::optional<uint32_t> boundary) {
     std::lock_guard<std::mutex> lock(pcm_mutex_);
-    pcm_queue_.clear();
-    queued_samples_ = 0;
+    const auto before = queued_samples_;
+    flush_boundary_ = boundary;
+    if (!boundary) {
+        pcm_queue_.clear();
+        queued_samples_ = 0;
+    } else {
+        for (auto it = pcm_queue_.begin(); it != pcm_queue_.end();) {
+            queued_samples_ -= trim_before(it->rtp, it->samples, *boundary);
+            if (it->samples.empty()) it = pcm_queue_.erase(it);
+            else ++it;
+        }
+    }
     clear_output_ = true;
+    LOG_INFO << "Audio FLUSH: boundary=" << (boundary ? std::to_string(*boundary) : "all")
+             << " removed_frames=" << (before - queued_samples_) / 2
+             << " retained_frames=" << queued_samples_ / 2;
     pcm_cv_.notify_all();
 }
 
@@ -380,8 +394,15 @@ void AudioReceiver::thread_fn() {
                             queued_samples_ -= pcm_queue_.front().samples.size();
                             pcm_queue_.pop_front();
                         }
-                        queued_samples_ += have;
-                        pcm_queue_.push_back(PcmFrame{pcm_rtp, std::vector<int16_t>(pcm, pcm + have)});
+                        PcmFrame frame{pcm_rtp, std::vector<int16_t>(pcm, pcm + have)};
+                        if (flush_boundary_) trim_before(frame.rtp, frame.samples, *flush_boundary_);
+                        if (!frame.samples.empty()) {
+                            // Boundary reached; normal duplicate/late handling
+                            // takes over instead of keeping a fence for hours.
+                            flush_boundary_.reset();
+                            queued_samples_ += frame.samples.size();
+                            pcm_queue_.push_back(std::move(frame));
+                        }
                     }
                     pcm_rtp += static_cast<uint32_t>(have / 2);
                     pcm_cv_.notify_one();
@@ -454,6 +475,11 @@ void AudioReceiver::playout_fn() {
             fallback_logged = true;
         }
         const int64_t pending = output_ ? output_->pending_ns() : 0;
+        // Keep future PCM under our control: SDL can only flush its entire queue.
+        if (synchronize_ && pending > 60'000'000LL) {
+            pcm_cv_.wait_for(lock, std::chrono::milliseconds(5));
+            continue;
+        }
         const int64_t advance = target ? *target - now_ns() - pending : 0;
         if (target && !scheduled_logged) {
             LOG_INFO << "Audio synchronized playout: initial_wait_ms=" << advance / 1'000'000;

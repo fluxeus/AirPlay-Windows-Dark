@@ -13,6 +13,7 @@
 #include <deque>
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 
 // Forward-declare OpenSSL type to keep this header self-contained.
 struct evp_cipher_ctx_st;
@@ -72,7 +73,7 @@ public:
     // Thread-safe: hand to SdlAudioOutput when it exists.
     void set_volume_db(float db);
     void set_synchronized(bool enabled);
-    void flush();
+    void flush(std::optional<uint32_t> boundary = {});
 
 private:
     void thread_fn();
@@ -91,6 +92,7 @@ private:
     uint64_t sync_ntp_ = 0;
     bool have_anchor_ = false;
     bool clear_output_ = false;
+    std::optional<uint32_t> flush_boundary_;
     std::atomic<bool> synchronize_{false};
     EVP_CIPHER_CTX*                 aes_ctx_{nullptr};
     std::unique_ptr<AacDecoder>     decoder_;

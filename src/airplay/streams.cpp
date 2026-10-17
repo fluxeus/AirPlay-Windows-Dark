@@ -304,8 +304,8 @@ void StreamSession::set_audio_volume_db(float db) {
     if (audio_) audio_->set_volume_db(db);
 }
 
-void StreamSession::flush_audio() {
-    if (audio_) audio_->flush();
+void StreamSession::flush_audio(std::optional<uint32_t> boundary) {
+    if (audio_) audio_->flush(boundary);
 }
 
 bool StreamSession::audio_only() const {

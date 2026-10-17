@@ -84,7 +84,7 @@ public:
 
     // Thread-safe: forwards to AudioReceiver if a type-96 stream is alive.
     void set_audio_volume_db(float db);
-    void flush_audio();
+    void flush_audio(std::optional<uint32_t> boundary = {});
 
     void teardown();
     bool audio_only() const;

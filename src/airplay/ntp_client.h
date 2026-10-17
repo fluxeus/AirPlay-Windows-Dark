@@ -1,11 +1,13 @@
 #pragma once
 
 #include "net/socket.h"
+#include "airplay/ntp_clock.h"
 
 #include <atomic>
 #include <cstdint>
 #include <string>
 #include <thread>
+#include <mutex>
 
 namespace ap::airplay {
 
@@ -24,9 +26,8 @@ namespace ap::airplay {
 //   [24..31] : send_time as NTP timestamp (our "now")
 //
 // NTP timestamp = uint32 seconds since 1900-01-01 (big-endian) + uint32
-// fractional seconds (big-endian). We don't actually use the responses
-// for clock correction yet — we just drain the socket. iOS only cares
-// that we're polling regularly.
+// fractional seconds (big-endian). Validated replies map the sender's
+// clock to local steady_clock for timestamped audio-only playback.
 class NtpClient {
 public:
     NtpClient();
@@ -45,6 +46,8 @@ public:
     // Stops and joins the thread. Safe to call multiple times.
     void stop();
 
+    std::optional<int64_t> local_time_ns(uint64_t remote_ntp) const;
+
 private:
     void thread_fn();
 
@@ -53,6 +56,8 @@ private:
     uint16_t            remote_port_{0};
     std::atomic<bool>   running_{false};
     std::thread         thread_;
+    mutable std::mutex clock_mutex_;
+    NtpClock clock_;
 };
 
 } // namespace ap::airplay

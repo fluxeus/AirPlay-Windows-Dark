@@ -198,6 +198,7 @@ bool StreamSession::setup_stream(int type,
             return false;
         }
         data_port = p;
+        if (audio_) audio_->set_synchronized(false);
 
         StreamChannel ch;
         ch.type         = type;
@@ -226,6 +227,9 @@ bool StreamSession::setup_stream(int type,
         audio_ = std::make_unique<ap::audio::AudioReceiver>();
         ap::audio::AudioReceiver::Config ac;
         ac.data_sock   = d_sock;
+        ac.control_sock = c_sock;
+        ac.ntp = ntp_.get();
+        ac.synchronize = mirror_ == nullptr;
         ac.aes_key     = opts.aes_key;
         ac.aes_iv      = opts.aes_iv;
         ac.ct          = opts.ct;
@@ -239,8 +243,8 @@ bool StreamSession::setup_stream(int type,
             audio_.reset();
         }
 
-        // Control socket: iOS sends retransmit/feedback packets here; we
-        // just keep it bound so iOS isn't flooded with ICMP unreachables.
+        // AudioReceiver borrows the control socket to read RTP/NTP anchors.
+        // Keep ownership here; stop the receiver before closing it.
         StreamChannel ch;
         ch.type         = type;
         ch.data_port    = d_port;
@@ -267,6 +271,7 @@ void StreamSession::stop_stream(int type) {
     if (type == 110 && mirror_) {
         mirror_->stop();
         mirror_.reset();
+        if (audio_) audio_->set_synchronized(true);
     }
     if (type == 96 && audio_) {
         audio_->stop();
@@ -289,12 +294,18 @@ bool StreamSession::start_ntp(const std::string& remote_ip, uint16_t remote_port
         LOG_ERROR << "start_ntp: timing socket not bound (call setup_session first)";
         return false;
     }
-    ntp_ = std::make_unique<NtpClient>();
+    // Preserve the address borrowed by an active AudioReceiver on repeated SETUP.
+    if (!ntp_) ntp_ = std::make_unique<NtpClient>();
+    else ntp_->stop();
     return ntp_->start(ap2_timing_sock, remote_ip, remote_port);
 }
 
 void StreamSession::set_audio_volume_db(float db) {
     if (audio_) audio_->set_volume_db(db);
+}
+
+void StreamSession::flush_audio() {
+    if (audio_) audio_->flush();
 }
 
 bool StreamSession::audio_only() const {

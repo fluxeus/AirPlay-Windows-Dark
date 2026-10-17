@@ -26,9 +26,9 @@ bool SdlAudioOutput::start(int sample_rate, int channels) {
     want.callback = nullptr;          // push mode via SDL_QueueAudio
 
     SDL_AudioSpec got{};
-    device_ = SDL_OpenAudioDevice(nullptr, 0, &want, &got,
-                                  SDL_AUDIO_ALLOW_FREQUENCY_CHANGE
-                                | SDL_AUDIO_ALLOW_CHANNELS_CHANGE);
+    // PCM is always supplied at the decoder's frequency/channel count.
+    // SDL performs any hardware conversion instead of changing this contract.
+    device_ = SDL_OpenAudioDevice(nullptr, 0, &want, &got, 0);
     if (device_ == 0) {
         LOG_ERROR << "SDL_OpenAudioDevice failed: " << SDL_GetError();
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
@@ -37,6 +37,7 @@ bool SdlAudioOutput::start(int sample_rate, int channels) {
 
     sample_rate_ = got.freq;
     channels_    = got.channels;
+    buffer_frames_ = got.samples;
     SDL_PauseAudioDevice(device_, 0);
     LOG_INFO << "SdlAudioOutput playing at " << sample_rate_ << " Hz x "
              << channels_ << "ch (format int16)";
@@ -99,6 +100,18 @@ void SdlAudioOutput::set_volume_db(float db) {
 
 uint32_t SdlAudioOutput::queued_bytes() const {
     return device_ ? SDL_GetQueuedAudioSize(device_) : 0u;
+}
+
+int64_t SdlAudioOutput::pending_ns() const {
+    if (!device_ || sample_rate_ <= 0 || channels_ <= 0) return 0;
+    const int64_t frames = queued_bytes() / (channels_ * sizeof(int16_t));
+    // SDL does not expose the hardware presentation clock. Include one
+    // negotiated device buffer as an estimate, rather than a fixed 25 ms.
+    return (frames + buffer_frames_) * 1'000'000'000LL / sample_rate_;
+}
+
+void SdlAudioOutput::clear() {
+    if (device_) SDL_ClearQueuedAudio(device_);
 }
 
 } // namespace ap::audio

@@ -38,11 +38,14 @@ public:
 
     // Bytes currently queued (not yet played). Useful for back-pressure.
     uint32_t queued_bytes() const;
+    int64_t pending_ns() const;
+    void clear();
 
 private:
     unsigned int       device_{0};   // SDL_AudioDeviceID is uint32_t
     int                channels_{0};
     int                sample_rate_{0};
+    int                buffer_frames_{0};
     std::atomic<float> gain_{1.0f};  // linear multiplier, 0.0 = muted
 };
 

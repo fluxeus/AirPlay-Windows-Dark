@@ -10,12 +10,16 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <deque>
+#include <condition_variable>
+#include <mutex>
 
 // Forward-declare OpenSSL type to keep this header self-contained.
 struct evp_cipher_ctx_st;
 typedef struct evp_cipher_ctx_st EVP_CIPHER_CTX;
 
 namespace ap::video { class VideoRenderer; }
+namespace ap::airplay { class NtpClient; }
 
 namespace ap::audio {
 
@@ -33,14 +37,16 @@ namespace ap::audio {
 // don't fit into a full 16-byte block are copied unchanged.
 //
 // The decrypted payload is a codec frame (ALAC / AAC-ELD / AAC-LC
-// depending on the `ct` negotiated in SETUP). We don't decode yet: the
-// receiver just logs a hex dump of the first packet so the codec can be
-// identified by its signature, then counts packets for telemetry. The
-// full decode + playback path (FFmpeg → WASAPI) comes next.
+// depending on the `ct` negotiated in SETUP). A network thread decodes
+// to bounded PCM; a playout thread schedules audio-only playback using
+// RTP/NTP anchors. Mirroring retains immediate audio submission.
 class AudioReceiver {
 public:
     struct Config {
         socket_t                    data_sock = INVALID_SOCK; // ownership transferred
+        socket_t                    control_sock = INVALID_SOCK; // borrowed; owner closes after stop
+        ap::airplay::NtpClient*      ntp = nullptr; // borrowed; outlives receiver
+        bool                        synchronize = false; // audio-only playback
         std::vector<unsigned char>  aes_key;                   // 16 B
         std::vector<unsigned char>  aes_iv;                    // 16 B
         int                         ct          = 0;           // compression type
@@ -65,13 +71,27 @@ public:
 
     // Thread-safe: hand to SdlAudioOutput when it exists.
     void set_volume_db(float db);
+    void set_synchronized(bool enabled);
+    void flush();
 
 private:
     void thread_fn();
+    void playout_fn();
 
     Config                      cfg_;
     std::atomic<bool>           running_{false};
     std::thread                 thread_;
+    std::thread                 playout_thread_;
+    struct PcmFrame { uint32_t rtp; std::vector<int16_t> samples; };
+    std::mutex pcm_mutex_;
+    std::condition_variable pcm_cv_;
+    std::deque<PcmFrame> pcm_queue_;
+    std::size_t queued_samples_ = 0;
+    uint32_t sync_rtp_ = 0;
+    uint64_t sync_ntp_ = 0;
+    bool have_anchor_ = false;
+    bool clear_output_ = false;
+    std::atomic<bool> synchronize_{false};
     EVP_CIPHER_CTX*                 aes_ctx_{nullptr};
     std::unique_ptr<AacDecoder>     decoder_;
     std::unique_ptr<SdlAudioOutput> output_;

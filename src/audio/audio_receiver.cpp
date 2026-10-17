@@ -1,8 +1,10 @@
 #include "audio/audio_receiver.h"
+#include "airplay/ntp_client.h"
 #include "log.h"
 #include "video/video_renderer.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
@@ -65,7 +67,7 @@ AudioReceiver::AudioReceiver()  = default;
 AudioReceiver::~AudioReceiver() { stop(); }
 
 bool AudioReceiver::start(Config cfg) {
-    if (cfg.data_sock == INVALID_SOCK) return false;
+    if (cfg.data_sock == INVALID_SOCK || cfg.sample_rate <= 0) return false;
     if (cfg.aes_key.size() != 16 || cfg.aes_iv.size() != 16) {
         LOG_ERROR << "AudioReceiver: aes_key/aes_iv must be 16 B "
                   << "(got " << cfg.aes_key.size() << '/' << cfg.aes_iv.size() << ')';
@@ -113,6 +115,8 @@ bool AudioReceiver::start(Config cfg) {
     set_recv_timeout(cfg_.data_sock, kRecvTimeoutMs);
 
     running_ = true;
+    synchronize_ = cfg_.synchronize && cfg_.ntp;
+    playout_thread_ = std::thread(&AudioReceiver::playout_fn, this);
     thread_  = std::thread(&AudioReceiver::thread_fn, this);
     LOG_INFO << "AudioReceiver listening (ct=" << cfg_.ct
              << ' ' << ct_name(cfg_.ct)
@@ -124,14 +128,25 @@ void AudioReceiver::set_volume_db(float db) {
     if (output_) output_->set_volume_db(db);
 }
 
+void AudioReceiver::flush() {
+    std::lock_guard<std::mutex> lock(pcm_mutex_);
+    pcm_queue_.clear();
+    queued_samples_ = 0;
+    clear_output_ = true;
+    pcm_cv_.notify_all();
+}
+
+void AudioReceiver::set_synchronized(bool enabled) {
+    if (synchronize_.exchange(enabled && cfg_.ntp) != (enabled && cfg_.ntp)) flush();
+}
+
 void AudioReceiver::stop() {
     if (!running_.exchange(false)) return;
-
-    if (cfg_.data_sock != INVALID_SOCK) {
-        ap::net::close_socket(cfg_.data_sock);
-        cfg_.data_sock = INVALID_SOCK;
-    }
+    pcm_cv_.notify_all();
     if (thread_.joinable()) thread_.join();
+    if (playout_thread_.joinable()) playout_thread_.join();
+    if (cfg_.data_sock != INVALID_SOCK) ap::net::close_socket(cfg_.data_sock);
+    cfg_.data_sock = INVALID_SOCK;
 
     if (output_)  { output_->stop();  output_.reset();  }
     if (decoder_) {                    decoder_.reset(); }
@@ -175,8 +190,51 @@ void AudioReceiver::thread_fn() {
     // renderer to rate=0 within 500ms and paint a pause badge over the
     // first video frame, even though the iPhone is actively playing.
     bool audio_ever_seen = false;
+    uint64_t sync_packets = 0;
 
     while (running_.load()) {
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(cfg_.data_sock, &readable);
+        socket_t highest = cfg_.data_sock;
+        if (cfg_.control_sock != INVALID_SOCK) {
+            FD_SET(cfg_.control_sock, &readable);
+            if (cfg_.control_sock > highest) highest = cfg_.control_sock;
+        }
+        timeval timeout{0, kRecvTimeoutMs * 1000};
+        const int ready = ::select(static_cast<int>(highest + 1), &readable, nullptr, nullptr, &timeout);
+        if (!running_) break;
+        if (ready > 0 && cfg_.control_sock != INVALID_SOCK &&
+            FD_ISSET(cfg_.control_sock, &readable)) {
+            unsigned char control[2048];
+            const int size = ::recvfrom(cfg_.control_sock, reinterpret_cast<char*>(control), sizeof(control), 0, nullptr, nullptr);
+            if (size >= 20 && (control[1] & 0x7f) == 0x54) {
+                const auto be32 = [&](int offset) {
+                    return (static_cast<uint32_t>(control[offset]) << 24)
+                         | (static_cast<uint32_t>(control[offset + 1]) << 16)
+                         | (static_cast<uint32_t>(control[offset + 2]) << 8)
+                         | control[offset + 3];
+                };
+                const uint64_t ntp = (static_cast<uint64_t>(be32(8)) << 32) | be32(12);
+                ++sync_packets;
+                {
+                    std::lock_guard<std::mutex> lock(pcm_mutex_);
+                    sync_rtp_ = be32(4);
+                    sync_ntp_ = ntp;
+                    have_anchor_ = ntp != 0;
+                }
+                pcm_cv_.notify_all();
+                if (sync_packets <= 3 || sync_packets % 10 == 0)
+                    LOG_INFO << "Audio timing anchor: rtp=" << be32(4)
+                             << " ntp_raw=" << ntp << " next_rtp=" << be32(16);
+            }
+        }
+        if (ready <= 0 || !FD_ISSET(cfg_.data_sock, &readable)) {
+            if (cfg_.renderer && audio_ever_seen &&
+                std::chrono::steady_clock::now() - last_packet >= std::chrono::milliseconds(kSilencePauseMs))
+                cfg_.renderer->push_playback_rate(0.0f);
+            continue;
+        }
         int n = ::recvfrom(cfg_.data_sock,
                            reinterpret_cast<char*>(buf), sizeof(buf), 0,
                            nullptr, nullptr);
@@ -306,20 +364,38 @@ void AudioReceiver::thread_fn() {
                 // frame at 480 spf.
                 int16_t pcm[8192];
                 int     have = 0;
+                uint32_t pcm_rtp = ts;
                 while ((have = decoder_->pull_pcm_s16(
                             pcm, static_cast<int>(sizeof(pcm) / sizeof(pcm[0])))) > 0) {
                     if (cfg_.renderer) {
                         cfg_.renderer->push_audio_pcm(
                             pcm, have, cfg_.sample_rate, 2);
                     }
-                    if (output_) output_->push(pcm, have);
+                    {
+                        std::lock_guard<std::mutex> lock(pcm_mutex_);
+                        // Bound decoded PCM to five seconds, including when
+                        // sender timing is unavailable or malformed.
+                        const auto limit = static_cast<std::size_t>(cfg_.sample_rate) * 2 * 5;
+                        while (!pcm_queue_.empty() && queued_samples_ + have > limit) {
+                            queued_samples_ -= pcm_queue_.front().samples.size();
+                            pcm_queue_.pop_front();
+                        }
+                        queued_samples_ += have;
+                        pcm_queue_.push_back(PcmFrame{pcm_rtp, std::vector<int16_t>(pcm, pcm + have)});
+                    }
+                    pcm_rtp += static_cast<uint32_t>(have / 2);
+                    pcm_cv_.notify_one();
                 }
             }
         }
 
         if ((pkts % 500) == 0) {
+            const uint64_t queue_ms = output_
+                ? static_cast<uint64_t>(output_->queued_bytes()) * 1000 / (cfg_.sample_rate * 2 * sizeof(int16_t))
+                : 0;
             LOG_INFO << "audio: " << pkts << " pkts, "
-                     << (total_bytes / 1024) << " KB received";
+                     << (total_bytes / 1024) << " KB received, rtp=" << ts
+                     << " sink_queue=" << queue_ms << " ms, sync_packets=" << sync_packets;
         }
     }
 
@@ -334,6 +410,84 @@ void AudioReceiver::thread_fn() {
              << "  [65..256]="  << hist_65_256
              << "  [257..512]=" << hist_257_512
              << "  [513+]="     << hist_513_plus;
+}
+
+void AudioReceiver::playout_fn() {
+    using Clock = std::chrono::steady_clock;
+    const auto now_ns = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now().time_since_epoch()).count();
+    };
+    auto waiting_since = Clock::now();
+    bool fallback_logged = false;
+    bool scheduled_logged = false;
+    uint64_t played = 0, late_dropped = 0;
+    std::unique_lock<std::mutex> lock(pcm_mutex_);
+    while (running_) {
+        if (clear_output_) {
+            if (output_) output_->clear();
+            clear_output_ = false;
+            waiting_since = Clock::now();
+        }
+        if (pcm_queue_.empty()) {
+            waiting_since = Clock::now();
+            pcm_cv_.wait_for(lock, std::chrono::milliseconds(20));
+            continue;
+        }
+
+        std::optional<int64_t> target;
+        if (synchronize_ && cfg_.ntp && have_anchor_) {
+            target = cfg_.ntp->local_time_ns(sync_ntp_);
+            if (target) {
+                const uint32_t ticks = pcm_queue_.front().rtp - sync_rtp_;
+                const int64_t delta = ticks <= 0x7fffffffU
+                    ? ticks : static_cast<int64_t>(ticks) - 0x100000000LL;
+                *target += delta * 1'000'000'000LL / cfg_.sample_rate;
+            }
+        }
+        if (synchronize_ && !target && Clock::now() - waiting_since < std::chrono::seconds(2)) {
+            pcm_cv_.wait_for(lock, std::chrono::milliseconds(10));
+            continue;
+        }
+        if (synchronize_ && !target && !fallback_logged) {
+            LOG_WARN << "Audio sync unavailable after 2s; playing without timestamp scheduling";
+            fallback_logged = true;
+        }
+        const int64_t pending = output_ ? output_->pending_ns() : 0;
+        const int64_t advance = target ? *target - now_ns() - pending : 0;
+        if (target && !scheduled_logged) {
+            LOG_INFO << "Audio synchronized playout: initial_wait_ms=" << advance / 1'000'000;
+            scheduled_logged = true;
+        }
+        // Ignore broken anchors rather than buffering forever.
+        if (target && advance > 5'000'000'000LL) {
+            target.reset();
+        } else if (target && advance > 1'000'000LL) {
+            pcm_cv_.wait_for(lock, std::chrono::nanoseconds(std::min<int64_t>(advance, 10'000'000LL)));
+            continue;
+        } else if (target && advance < -250'000'000LL) {
+            queued_samples_ -= pcm_queue_.front().samples.size();
+            pcm_queue_.pop_front();
+            ++late_dropped;
+            if (late_dropped == 1 || late_dropped % 500 == 0)
+                LOG_WARN << "Audio late frames dropped=" << late_dropped
+                         << " behind_ms=" << -advance / 1'000'000;
+            continue;
+        }
+
+        auto frame = std::move(pcm_queue_.front());
+        pcm_queue_.pop_front();
+        queued_samples_ -= frame.samples.size();
+        // Keep flush and enqueue serialized: after FLUSH is observed no
+        // already-dequeued PCM can be reinserted into SDL by this thread.
+        if (output_) output_->push(frame.samples.data(), static_cast<int>(frame.samples.size()));
+        if (++played <= 3 || played % 500 == 0)
+            LOG_INFO << "Audio playout: synchronized=" << (target ? 1 : 0)
+                     << " remaining=" << queued_samples_ / 2 << " samples, sink_ms="
+                     << pending / 1'000'000 << " late_dropped=" << late_dropped;
+    }
+    pcm_queue_.clear();
+    queued_samples_ = 0;
 }
 
 } // namespace ap::audio

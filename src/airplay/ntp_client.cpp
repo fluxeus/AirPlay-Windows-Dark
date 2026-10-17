@@ -29,6 +29,11 @@ uint64_t now_ns_since_1970() {
         duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());
 }
 
+int64_t steady_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void put_u32_be(unsigned char* buf, int off, uint32_t v) {
     buf[off + 0] = static_cast<unsigned char>((v >> 24) & 0xff);
     buf[off + 1] = static_cast<unsigned char>((v >> 16) & 0xff);
@@ -84,6 +89,10 @@ bool NtpClient::start(socket_t sock, const std::string& remote_ip, uint16_t remo
     sock_        = sock;
     remote_ip_   = remote_ip;
     remote_port_ = remote_port;
+    {
+        std::lock_guard<std::mutex> lock(clock_mutex_);
+        clock_ = NtpClock{};
+    }
     running_     = true;
     thread_      = std::thread(&NtpClient::thread_fn, this);
     LOG_INFO << "NTP client polling " << remote_ip_ << ':' << remote_port_
@@ -178,6 +187,7 @@ void NtpClient::thread_fn() {
 
     while (running_) {
         uint64_t send_time = now_ns_since_1970();
+        const auto sent_steady = steady_ns();
         put_ntp_timestamp(request, 24, send_time);
         if (recv_time) {
             put_u64_be       (request,  8, client_ref_time);
@@ -197,10 +207,23 @@ void NtpClient::thread_fn() {
         int n = ::recvfrom(sock_,
                            reinterpret_cast<char*>(response), sizeof(response), 0,
                            nullptr, nullptr);
-        if (n >= 32) {
+        const auto received_steady = steady_ns();
+        if (n >= 32 && (response[1] & 0x7f) == 0x53 &&
+            get_u64_be(response, 8) == get_u64_be(request, 24)) {
             recv_time       = now_ns_since_1970();
             client_ref_time = get_u64_be(response, 24);
             ++probes_received;
+            {
+                std::lock_guard<std::mutex> lock(clock_mutex_);
+                clock_.observe(sent_steady, received_steady,
+                    get_u64_be(response, 16), get_u64_be(response, 24));
+            }
+            if (probes_received <= 3 || probes_received % 10 == 0)
+                LOG_INFO << "NTP timing sample: request_raw=" << get_u64_be(request, 24)
+                         << " echo_raw=" << get_u64_be(response, 8)
+                         << " remote_recv_raw=" << get_u64_be(response, 16)
+                         << " remote_send_raw=" << client_ref_time
+                         << " local_recv_ns=" << recv_time;
         }
         // else: timeout / no reply; send another probe next tick anyway.
 
@@ -217,6 +240,11 @@ void NtpClient::thread_fn() {
     LOG_INFO << "NtpClient thread exiting";
     LOG_INFO << "NTP client stopped (sent=" << probes_sent
              << ", received=" << probes_received << ")";
+}
+
+std::optional<int64_t> NtpClient::local_time_ns(uint64_t remote_ntp) const {
+    std::lock_guard<std::mutex> lock(clock_mutex_);
+    return clock_.local_time(remote_ntp, steady_ns());
 }
 
 } // namespace ap::airplay

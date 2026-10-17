@@ -118,7 +118,8 @@ Response handle_info(const DeviceContext& ctx, const Request& req) {
     } else {
         // Degraded fallback (libplist missing at build time).
         r.set_header("Content-Type", "text/plain");
-        std::string s = "name=" + ctx.name + "\ndeviceid=" + ctx.deviceid + '\n';
+        std::string s = "name=" + (ctx.live ? ctx.live->receiver_name() : ctx.name)
+                      + "\ndeviceid=" + ctx.deviceid + '\n';
         r.body.assign(s.begin(), s.end());
         LOG_WARN << "/info serving text fallback — iOS won't accept this";
     }

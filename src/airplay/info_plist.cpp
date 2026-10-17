@@ -112,7 +112,7 @@ std::vector<unsigned char> build_info_plist(const DeviceContext& ctx) {
     set_str (root, "deviceid",      ctx.deviceid);
     set_str (root, "macAddress",    ctx.deviceid);
     set_str (root, "model",         ctx.model);
-    set_str (root, "name",          ctx.name);
+    set_str (root, "name",          ctx.live ? ctx.live->receiver_name() : ctx.name);
     set_str (root, "pi",            ctx.pi);
     set_str (root, "sourceVersion", ctx.srcvers);
     // Recompose the features bits with the live HEVC toggle: bit 42

@@ -65,6 +65,9 @@ public:
     // Tell the thread to exit, join it, tear down SDL.
     void stop();
 
+    // Process window activation on its owning render thread.
+    void request_show() { show_requested_.store(true); }
+
     // Producer entry point. Copies each YUV plane into internal buffers
     // (skipping AVFrame padding via per-plane strides). Thread-safe.
     // origin_ns: optional steady_clock timestamp captured upstream
@@ -195,6 +198,7 @@ private:
     void run(const std::string& title);
 
     std::atomic<bool> running_{false};
+    std::atomic<bool> show_requested_{false};
     std::atomic<bool> closed_{false};
     std::thread       thread_;
 

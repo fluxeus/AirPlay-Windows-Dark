@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
+#include <string>
 
 namespace ap::airplay {
 
@@ -11,10 +13,17 @@ namespace ap::airplay {
 // so the overlay can change values that take effect on the next
 // iPhone /info request — practically: on the next reconnect.
 //
-// Atomics on every field so the writer (UI thread) and the readers
-// (RTSP server thread serving /info) never race; values are
-// independent so a torn write across them is harmless.
+// Numeric fields are atomic; the receiver name is protected by a mutex.
+// The UI and RTSP threads can access these independently without racing.
 struct LiveSettings {
+    std::string receiver_name() const {
+        std::lock_guard<std::mutex> lock(name_mutex_);
+        return receiver_name_;
+    }
+    void set_receiver_name(const std::string& name) {
+        std::lock_guard<std::mutex> lock(name_mutex_);
+        receiver_name_ = name;
+    }
     // Display box advertised in /info — see DeviceContext::mirror_*.
     std::atomic<int>  mirror_width{2560};
     std::atomic<int>  mirror_height{1440};
@@ -52,6 +61,10 @@ struct LiveSettings {
     // Display only: -1 follows the orientation encoded by iOS; 0..3 adds
     // clockwise quarter turns to the received image. Recording is unchanged.
     std::atomic<int> video_rotation{-1};
+
+private:
+    mutable std::mutex name_mutex_;
+    std::string receiver_name_ = "AirPlay-Windows";
 };
 
 } // namespace ap::airplay

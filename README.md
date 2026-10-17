@@ -30,7 +30,7 @@ graphics hardware and drivers. Software decoding is available as a fallback.
 | Music information | Cover art, title/artist/album, elapsed/total time and pause state when supplied by the sender |
 | Display controls | Fullscreen, borderless Hide UI, automatic/manual rotation |
 | Recording | MP4 video with a stereo AAC audio track when RAOP audio is received |
-| Settings | Saved in `%APPDATA%\AirPlay-Windows\settings.ini`, including rotation and display preferences |
+| Settings | Saved in `%APPDATA%\AirPlay-Windows\settings.ini`, including receiver name, rotation and display preferences |
 | Sessions | One active device session at a time |
 | Direct HLS playback | Experimental, opt-in with `--hls-proxy-playback` |
 | DRM-protected streaming | Not supported |
@@ -40,6 +40,12 @@ connection; the sending device may reconnect automatically. Sender/app behavior
 can differ between screen mirroring and direct media streaming.
 
 ## Display and resolution
+
+In **OPTIONS > Receiver Name**, enter a name and choose **Apply name** (or press
+Enter). The name is saved immediately and both AirPlay and RAOP discovery are
+updated without restarting the receiver. Accented names are supported; names
+must fit within 50 UTF-8 bytes and cannot contain dots or backslashes. Devices
+may briefly retain the previous name in their discovery cache.
 
 In **OPTIONS > Rotation**, choose **Automatic (device)** or a clockwise manual
 rotation of **0, 90, 180 or 270 degrees** relative to the received image.
@@ -220,6 +226,12 @@ Audio-only sessions expose Play/Pause, Previous and Next when the sender's DACP
 service is available. These controls were validated with an iPhone. Progress
 is read-only: the tested iOS sender rejects absolute seek requests with HTTP 400,
 including the POST variant. No Bonjour installation is required on Windows.
+
+In direct audio-only mode, the tested iPhone can keep AirPlay selected after
+Disconnect or app exit. Select the iPhone speaker manually to clear this state.
+Disconnect and exit were validated on an iPhone for mirroring, including music
+played during mirroring. Scheduling audio playback against RTP/NTP timestamps
+remains future work.
 
 ## Tests
 

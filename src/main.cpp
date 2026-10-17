@@ -16,6 +16,7 @@
 #include "mdns/mdns_service.h"
 #include "net/socket.h"
 #include "settings.h"
+#include "platform/single_instance.h"
 #include "usb/usb_supervisor.h"
 #include "video/video_renderer.h"
 
@@ -76,6 +77,22 @@ ap::airplay::DeviceContext build_device_context(bool hls_playback) {
 } // namespace
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    ap::platform::SingleInstance instance;
+    // Help is read-only and should remain usable while the receiver is open.
+    bool help_only = false;
+    for (int i = 1; i < argc; ++i)
+        help_only |= std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h";
+    if (!help_only) {
+        const auto result = instance.acquire();
+        if (result == ap::platform::SingleInstance::Result::Secondary) return 0;
+        if (result == ap::platform::SingleInstance::Result::Error) {
+            MessageBoxW(nullptr, L"Unable to initialize the single application instance.",
+                        L"AirPlay-Windows", MB_OK | MB_ICONERROR);
+            return 1;
+        }
+    }
+#endif
     // Logs are off by default in the published binary. Scan for the
     // toggle BEFORE anything else so even the very first init message
     // honours the flag.
@@ -196,6 +213,7 @@ int main(int argc, char** argv) {
     }
 
     auto ctx = build_device_context(hls_playback);
+    ctx.name = saved.receiver_name;
     ctx.mirror_width   = mirror_w;
     ctx.mirror_height  = mirror_h;
     ctx.mirror_hwaccel = mirror_hwaccel;
@@ -210,6 +228,7 @@ int main(int argc, char** argv) {
     // /info reads them on every iPhone handshake (so changes take
     // effect on the next reconnect).
     ap::airplay::LiveSettings live_settings;
+    live_settings.set_receiver_name(saved.receiver_name);
     live_settings.mirror_width.store(mirror_w);
     live_settings.mirror_height.store(mirror_h);
     live_settings.hevc_enabled.store(saved.hevc_enabled);
@@ -317,6 +336,18 @@ int main(int argc, char** argv) {
 
     LOG_INFO << "Ready. Close the window or press Ctrl-C to exit.";
     while (!g_stop && !renderer.user_closed()) {
+#if defined(_WIN32)
+        if (instance.activation_requested()) renderer.request_show();
+#endif
+        const auto receiver_name = live_settings.receiver_name();
+        if (receiver_name != ctx.name) {
+            mdns.stop();
+            ctx.name = receiver_name;
+            renderer.set_idle_info(ctx.name, display_ip);
+            ap::save_settings(ap::snapshot(live_settings));
+            if (!mdns.start(ctx, server.port()))
+                LOG_WARN << "Could not advertise the new receiver name";
+        }
         if (disconnect_requested.exchange(false)) {
             LOG_INFO << "Disconnect requested by toolbar";
             server.disconnect_clients();

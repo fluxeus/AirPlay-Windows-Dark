@@ -2,7 +2,9 @@
 #include "video/video_recorder.h"
 #include "video/gpu_video.h"
 #include "airplay/live_settings.h"
+#include "airplay/receiver_name.h"
 #include "log.h"
+#include "platform/single_instance.h"
 
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -804,6 +806,13 @@ void VideoRenderer::run(const std::string& title) {
              << 'x' << kDefaultWinHeight << ", resizable)";
 
     GpuVideo gpu_video;
+#if defined(_WIN32)
+    SDL_SysWMinfo instance_window_info{};
+    SDL_VERSION(&instance_window_info.version);
+    if (SDL_GetWindowWMInfo(window, &instance_window_info))
+        SetPropW(instance_window_info.info.win.window,
+                 ap::platform::kInstanceWindowProperty, reinterpret_cast<HANDLE>(1));
+#endif
     gpu_video.init(renderer);
     {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -888,6 +897,10 @@ void VideoRenderer::run(const std::string& title) {
     SDL_SetWindowHitTest(window, hit_test_cb, &ui);
 
     std::array<char, 1024> recording_dir{};
+    std::array<char, 51> receiver_name_buf{};
+    if (live_settings_)
+        std::snprintf(receiver_name_buf.data(), receiver_name_buf.size(), "%s",
+                      live_settings_->receiver_name().c_str());
     VideoRecorder::Options recording_options;
     const std::string default_recording_dir = VideoRecorder::default_directory();
     std::snprintf(recording_dir.data(), recording_dir.size(), "%s",
@@ -1006,6 +1019,16 @@ void VideoRenderer::run(const std::string& title) {
     };
 
     while (running_.load()) {
+        if (show_requested_.exchange(false)) {
+            SDL_ShowWindow(window);
+            if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)
+                SDL_RestoreWindow(window);
+            SDL_RaiseWindow(window);
+#if defined(_WIN32)
+            if (instance_window_info.info.win.window)
+                SetForegroundWindow(instance_window_info.info.win.window);
+#endif
+        }
         // Sync the SDL window border to the chromeless toggle. In
         // fullscreen the border is irrelevant (SDL handles it via
         // the fullscreen flag). Otherwise: borderless when the user
@@ -1692,6 +1715,26 @@ void VideoRenderer::run(const std::string& title) {
                 // hint strings (VSYNC / GPU decoder explanations, etc.)
                 // stay inside the panel instead of running off-screen.
                 ImGui::PushTextWrapPos(0.0f);
+                if (live_settings_ && ImGui::CollapsingHeader("Receiver Name",
+                        ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::SetNextItemWidth(-1.0f);
+                    const bool enter = ImGui::InputText("##receiver_name",
+                        receiver_name_buf.data(), receiver_name_buf.size(),
+                        ImGuiInputTextFlags_EnterReturnsTrue);
+                    const auto name = ap::airplay::normalize_receiver_name(receiver_name_buf.data());
+                    const bool changed = name != live_settings_->receiver_name();
+                    ImGui::BeginDisabled(name.empty() || !changed);
+                    const bool apply = ImGui::Button("Apply name");
+                    ImGui::EndDisabled();
+                    if ((apply || enter) && !name.empty() && changed) {
+                        live_settings_->set_receiver_name(name);
+                        std::snprintf(receiver_name_buf.data(), receiver_name_buf.size(), "%s", name.c_str());
+                    }
+                    if (name.empty())
+                        ImGui::TextDisabled("Use a name without dots or backslashes (max. 50 UTF-8 bytes).");
+                    else
+                        ImGui::TextDisabled("Shown in AirPlay on your devices. Saved automatically.");
+                }
                 if (ImGui::CollapsingHeader("Rotation",
                         ImGuiTreeNodeFlags_DefaultOpen)) {
                     if (live_settings_) {

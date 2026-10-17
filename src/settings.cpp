@@ -1,5 +1,6 @@
 #include "settings.h"
 #include "airplay/live_settings.h"
+#include "airplay/receiver_name.h"
 #include "log.h"
 
 #include <fstream>
@@ -45,7 +46,11 @@ PersistentSettings load_settings() {
         std::string val = line.substr(eq + 1);
 
         try {
-            if      (key == "mirror_width") {
+            if (key == "receiver_name") {
+                const auto name = airplay::normalize_receiver_name(val);
+                if (!name.empty()) s.receiver_name = name;
+            }
+            else if (key == "mirror_width") {
                 const int n = std::stoi(val);
                 if (n >= 320 && n <= 7680) s.mirror_width = n;
             }
@@ -95,7 +100,8 @@ void save_settings(const PersistentSettings& s) {
         return;
     }
 
-    out << "mirror_width="   << s.mirror_width   << '\n'
+    out << "receiver_name=" << s.receiver_name << '\n'
+        << "mirror_width="   << s.mirror_width   << '\n'
         << "mirror_height="  << s.mirror_height  << '\n'
         << "hevc_enabled="   << s.hevc_enabled   << '\n'
         << "max_fps="        << s.max_fps        << '\n'
@@ -111,6 +117,7 @@ void save_settings(const PersistentSettings& s) {
 
 PersistentSettings snapshot(const ap::airplay::LiveSettings& live) {
     PersistentSettings s;
+    s.receiver_name = live.receiver_name();
     s.mirror_width   = live.mirror_width.load(std::memory_order_relaxed);
     s.mirror_height  = live.mirror_height.load(std::memory_order_relaxed);
     s.hevc_enabled   = live.hevc_enabled.load(std::memory_order_relaxed);

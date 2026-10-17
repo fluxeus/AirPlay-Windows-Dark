@@ -439,7 +439,9 @@ void AudioReceiver::playout_fn() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
             Clock::now().time_since_epoch()).count();
     };
-    auto waiting_since = Clock::now();
+    // Clock acquisition is a startup grace period, not a new delay to insert
+    // every time a FLUSH or pause empties the PCM queue.
+    const auto clock_deadline = Clock::now() + std::chrono::seconds(2);
     bool fallback_logged = false;
     bool scheduled_logged = false;
     uint64_t played = 0, late_dropped = 0;
@@ -448,10 +450,8 @@ void AudioReceiver::playout_fn() {
         if (clear_output_) {
             if (output_) output_->clear();
             clear_output_ = false;
-            waiting_since = Clock::now();
         }
         if (pcm_queue_.empty()) {
-            waiting_since = Clock::now();
             pcm_cv_.wait_for(lock, std::chrono::milliseconds(20));
             continue;
         }
@@ -466,12 +466,12 @@ void AudioReceiver::playout_fn() {
                 *target += delta * 1'000'000'000LL / cfg_.sample_rate;
             }
         }
-        if (synchronize_ && !target && Clock::now() - waiting_since < std::chrono::seconds(2)) {
+        if (synchronize_ && !target && cfg_.ntp && cfg_.ntp->running() && Clock::now() < clock_deadline) {
             pcm_cv_.wait_for(lock, std::chrono::milliseconds(10));
             continue;
         }
         if (synchronize_ && !target && !fallback_logged) {
-            LOG_WARN << "Audio sync unavailable after 2s; playing without timestamp scheduling";
+            LOG_WARN << "Audio sync unavailable; playing without timestamp scheduling (no repeated startup wait)";
             fallback_logged = true;
         }
         const int64_t pending = output_ ? output_->pending_ns() : 0;

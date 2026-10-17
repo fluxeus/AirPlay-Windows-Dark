@@ -139,8 +139,8 @@ void NtpClient::thread_fn() {
     // that reach us over IPv6 also present their NTP peer as an IPv6
     // address (which the old inet_pton(AF_INET, ...) silently rejected
     // and made the thread exit immediately). getaddrinfo handles both
-    // families and, with AI_V4MAPPED, turns a v4 remote_ip_ into the
-    // ::ffff:x.y.z.w form so a dual-stack v6 socket can sendto it.
+    // families; IPv4 peers are explicitly mapped to ::ffff:x.y.z.w
+    // when our socket is dual-stack IPv6.
     sockaddr_storage remote{};
     socklen_t        remote_len = 0;
     {
@@ -157,10 +157,12 @@ void NtpClient::thread_fn() {
             got_local ? local_ss.ss_family : AF_UNSPEC;
 
         addrinfo hints{};
-        hints.ai_family   = sock_family;
+        // Windows does not reliably synthesize a mapped address for a numeric
+        // IPv4 literal with AF_INET6 | AI_NUMERICHOST | AI_V4MAPPED.
+        // Resolve the actual family, then map IPv4 explicitly for our socket.
+        hints.ai_family   = AF_UNSPEC;
         hints.ai_socktype = SOCK_DGRAM;
         hints.ai_flags    = AI_NUMERICHOST;
-        if (sock_family == AF_INET6) hints.ai_flags |= AI_V4MAPPED;
         const std::string port_str = std::to_string(remote_port_);
         addrinfo* info = nullptr;
         const int gai = ::getaddrinfo(remote_ip_.c_str(),
@@ -173,9 +175,32 @@ void NtpClient::thread_fn() {
             running_ = false;
             return;
         }
-        std::memcpy(&remote, info->ai_addr, info->ai_addrlen);
-        remote_len = static_cast<socklen_t>(info->ai_addrlen);
+        for (const auto* entry = info; entry; entry = entry->ai_next) {
+            if ((entry->ai_family == sock_family || sock_family == AF_UNSPEC) &&
+                entry->ai_addrlen <= sizeof(remote)) {
+                std::memcpy(&remote, entry->ai_addr, entry->ai_addrlen);
+                remote_len = static_cast<socklen_t>(entry->ai_addrlen);
+                break;
+            }
+            if (sock_family == AF_INET6 && entry->ai_family == AF_INET) {
+                const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(entry->ai_addr);
+                sockaddr_in6 mapped{};
+                mapped.sin6_family = AF_INET6;
+                mapped.sin6_port = ipv4->sin_port;
+                auto* bytes = reinterpret_cast<unsigned char*>(&mapped.sin6_addr);
+                bytes[10] = bytes[11] = 0xff;
+                std::memcpy(bytes + 12, &ipv4->sin_addr, sizeof(ipv4->sin_addr));
+                std::memcpy(&remote, &mapped, sizeof(mapped));
+                remote_len = sizeof(mapped);
+                break;
+            }
+        }
         ::freeaddrinfo(info);
+        if (!remote_len) {
+            LOG_ERROR << "NtpClient: no compatible peer address";
+            running_ = false;
+            return;
+        }
     }
 
     set_recv_timeout(sock_, kRecvTimeout);

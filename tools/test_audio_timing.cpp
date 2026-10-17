@@ -52,20 +52,33 @@ void put32(unsigned char* p, uint32_t v) { for (int i = 3; i >= 0; --i) { p[i] =
 void put64(unsigned char* p, uint64_t v) { put32(p, static_cast<uint32_t>(v >> 32)); put32(p + 4, static_cast<uint32_t>(v)); }
 struct Udp {
     socket_t fd = INVALID_SOCK;
-    sockaddr_in address{};
-    Udp() {
-        fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_storage address{};
+    SocketLength length = 0;
+    explicit Udp(int family = AF_INET) {
+        fd = ::socket(family, SOCK_DGRAM, IPPROTO_UDP);
         require(fd != INVALID_SOCK, "UDP socket");
-        address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        require(::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "UDP bind");
-        SocketLength size = sizeof(address);
-        require(getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) == 0, "UDP port");
+        if (family == AF_INET6) {
+            int off = 0;
+            require(setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&off), sizeof(off)) == 0, "Dual stack UDP");
+            auto& v6 = reinterpret_cast<sockaddr_in6&>(address);
+            v6.sin6_family = AF_INET6; v6.sin6_addr = in6addr_any;
+            length = sizeof(v6);
+        } else {
+            auto& v4 = reinterpret_cast<sockaddr_in&>(address);
+            v4.sin_family = AF_INET; v4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            length = sizeof(v4);
+        }
+        require(::bind(fd, reinterpret_cast<sockaddr*>(&address), length) == 0, "UDP bind");
+        require(getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) == 0, "UDP port");
     }
+    uint16_t port() const { return ntohs(address.ss_family == AF_INET6
+        ? reinterpret_cast<const sockaddr_in6&>(address).sin6_port
+        : reinterpret_cast<const sockaddr_in&>(address).sin_port); }
     ~Udp() { if (fd != INVALID_SOCK) ap::net::close_socket(fd); }
 };
 void send_to(Udp& source, const Udp& dest, const unsigned char* p, int size) {
     require(sendto(source.fd, reinterpret_cast<const char*>(p), size, 0,
-        reinterpret_cast<const sockaddr*>(&dest.address), sizeof(dest.address)) == size, "UDP send");
+        reinterpret_cast<const sockaddr*>(&dest.address), dest.length) == size, "UDP send");
 }
 std::vector<unsigned char> fixture() {
     const auto* codec = avcodec_find_encoder(AV_CODEC_ID_ALAC);
@@ -119,7 +132,8 @@ int main() {
         require(ap::net::global_init(), "Winsock");
         SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
         clock_tests();
-        Udp timing, responder, sender;
+        // Match the production socket: IPv6 dual-stack with an IPv4 sender.
+        Udp timing(AF_INET6), responder, sender;
         std::atomic<bool> running{true};
         std::thread remote([&] {
             while (running) {
@@ -137,7 +151,7 @@ int main() {
         });
         struct Join { std::thread& t; std::atomic<bool>& run; ~Join() { run = false; t.join(); } } join{remote, running};
         ap::airplay::NtpClient ntp;
-        require(ntp.start(timing.fd, "127.0.0.1", ntohs(responder.address.sin_port)), "NTP start");
+        require(ntp.start(timing.fd, "127.0.0.1", responder.port()), "NTP start");
         for (int i = 0; i < 200 && !ntp.local_time_ns(remote_now()); ++i) std::this_thread::sleep_for(10ms);
         const auto mapped = ntp.local_time_ns(remote_now());
         require(mapped && std::abs(*mapped - now_ns()) < 50'000'000, "Native UDP NTP maps sender epoch to steady clock");
@@ -150,7 +164,7 @@ int main() {
         // Receiver owns data socket after start; retain its address for sends.
         data.fd = INVALID_SOCK;
         const auto payload = fixture();
-        auto send_audio = [&](uint16_t seq, uint32_t rtp, int lead_seconds) {
+        auto send_audio = [&](uint16_t seq, uint32_t rtp, int lead_seconds, const Udp* destination = nullptr) {
             unsigned char anchor[20]{}; anchor[0] = 0x80; anchor[1] = 0xd4;
             put32(anchor + 4, rtp - lead_seconds * 44100); put64(anchor + 8, remote_now()); put32(anchor + 16, rtp);
             send_to(sender, control, anchor, 20);
@@ -164,7 +178,7 @@ int main() {
             require(EVP_EncryptUpdate(aes, packet.data() + 12, &out, payload.data(), blocks) == 1, "AES encrypt");
             std::memcpy(packet.data() + 12 + out, payload.data() + blocks, payload.size() - blocks);
             EVP_CIPHER_CTX_free(aes);
-            send_to(sender, data, packet.data(), static_cast<int>(packet.size()));
+            send_to(sender, destination ? *destination : data, packet.data(), static_cast<int>(packet.size()));
         };
         // First sync anchor crosses the 32-bit RTP timestamp rollover.
         const auto start = now_ns(); send_audio(1, 1000, 3);
@@ -188,6 +202,27 @@ int main() {
         const auto stopped = Clock::now(); receiver.stop();
         require(Clock::now() - stopped < 500ms, "Stop interrupts a future scheduled frame");
         ntp.stop();
+        // An unresponsive timing peer must not add two seconds at every FLUSH.
+        Udp silent_timing(AF_INET6), silent_peer, fallback_data;
+        ap::airplay::NtpClient silent_clock;
+        require(silent_clock.start(silent_timing.fd, "127.0.0.1", silent_peer.port()), "Silent timing peer");
+        ap::audio::AudioReceiver fallback;
+        auto fallback_config = config;
+        fallback_config.data_sock = fallback_data.fd;
+        fallback_config.control_sock = INVALID_SOCK;
+        fallback_config.ntp = &silent_clock;
+        require(fallback.start(fallback_config), "Fallback receiver");
+        fallback_data.fd = INVALID_SOCK;
+        send_audio(6, 52345678, 0, &fallback_data);
+        for (int i = 0; i < 280 && played < 4; ++i) std::this_thread::sleep_for(10ms);
+        require(played == 4, "Initial missing-clock fallback eventually plays");
+        fallback.flush();
+        const auto resumed = Clock::now();
+        send_audio(7, 52346030, 0, &fallback_data);
+        for (int i = 0; i < 30 && played < 5; ++i) std::this_thread::sleep_for(10ms);
+        require(played == 5 && Clock::now() - resumed < 400ms, "FLUSH does not repeat the two-second clock acquisition wait");
+        fallback.stop(); silent_clock.stop();
+        std::puts("PASS: IPv4 sender on dual-stack NTP socket; no repeated startup delay after FLUSH without a clock");
         SDL_Quit(); ap::net::global_shutdown();
         std::puts("PASS: NTP mapping, rollover, stale clock, timestamp playout, FLUSH, mirror mode and bounded shutdown");
         return 0;

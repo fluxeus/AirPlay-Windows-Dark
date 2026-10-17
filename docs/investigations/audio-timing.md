@@ -59,3 +59,17 @@ This does not infer that every FLUSH is a user pause or rebase the sender clock.
 Tests cover partial-block retention and full resets alongside synchronized
 playback. Logs include FLUSH boundaries and exact RTP progress for validation
 of the real iPhone pause/resume behavior, which still requires a physical test.
+
+The next real test still skipped. Its trace exposed a separate fault: the
+session used an IPv4 sender with a dual-stack IPv6 timing socket, and Windows
+`getaddrinfo` failed with error 11001 for the numeric IPv4 address under
+`AF_INET6`/`AI_V4MAPPED`. NTP never started; every playout log was unsynchronized.
+The fallback also restarted its two-second acquisition wait after every FLUSH.
+
+The follow-up resolves the peer's actual family and explicitly builds IPv4-mapped
+IPv6 addresses when needed. Clock acquisition now has one startup deadline,
+not a deadline restarted whenever the PCM queue empties or is flushed.
+The integration test now matches the production dual-stack/IPv4 combination:
+it failed before the address fix and passes afterwards. An unresponsive timing
+peer test also verifies that a second FLUSH resumes without another two-second
+wait. Real iPhone pause/resume validation is still pending for this build.

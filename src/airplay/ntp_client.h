@@ -47,6 +47,7 @@ public:
     void stop();
 
     std::optional<int64_t> local_time_ns(uint64_t remote_ntp) const;
+    bool running() const { return running_.load(); }
 
 private:
     void thread_fn();

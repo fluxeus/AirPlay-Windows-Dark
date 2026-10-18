@@ -3,8 +3,10 @@
 Native AirPlay receiver for Windows: screen mirroring, RAOP audio and MP4
 recording, based on [UxPlay](https://github.com/FDH2/UxPlay).
 
-Latest release: [v0.3.0](https://github.com/moieric11/AirPlay-Windows/releases/tag/v0.3.0)
-— [what changed](docs/releases/v0.3.0.md).
+Latest release: [v0.4.0](https://github.com/moieric11/AirPlay-Windows/releases/tag/v0.4.0)
+— [what changed](docs/releases/v0.4.0.md).
+
+![AirPlay Windows interface with Home, Music, Screen Mirroring and Settings navigation](docs/images/interface-preview.png)
 
 ## Get started
 
@@ -30,7 +32,7 @@ graphics hardware and drivers. Software decoding is available as a fallback.
 | Music information | Cover art, title/artist/album, elapsed/total time and pause state when supplied by the sender |
 | Display controls | Fullscreen, borderless Hide UI, automatic/manual rotation |
 | Recording | MP4 video with a stereo AAC audio track when RAOP audio is received |
-| Settings | Saved in `%APPDATA%\AirPlay-Windows\settings.ini`, including receiver name, rotation and display preferences |
+| Settings | Automatically saved in `%APPDATA%\AirPlay-Windows\settings.ini`, including display, diagnostics, window placement and recording preferences |
 | Sessions | One active device session at a time |
 | Direct HLS playback | Experimental, opt-in with `--hls-proxy-playback` |
 | DRM-protected streaming | Not supported |
@@ -41,18 +43,33 @@ can differ between screen mirroring and direct media streaming.
 
 ## Display and resolution
 
-In **OPTIONS > Receiver Name**, enter a name and choose **Apply name** (or press
-Enter). The name is saved immediately and both AirPlay and RAOP discovery are
+Home checks Windows Firewall permissions for the current executable and active
+network profiles in the background. If access is missing or blocked, choose
+**Allow on local network** and approve the Windows administrator prompt. This
+adds an inbound application rule restricted to the local subnet and resolves
+conflicting application block rules on those profiles. Other applications and
+global firewall policy are left untouched. Administrator-enforced restrictions
+are reported separately. Checks repeat automatically and run immediately after
+the rule update; cancelling the administrator prompt leaves the firewall unchanged.
+
+In **Settings > Receiver name**, enter a name and choose **Apply name** (or press
+Enter). The name is saved automatically and both AirPlay and RAOP discovery are
 updated without restarting the receiver. Accented names are supported; names
 must fit within 50 UTF-8 bytes and cannot contain dots or backslashes. Devices
 may briefly retain the previous name in their discovery cache.
 
-In **OPTIONS > Rotation**, choose **Automatic (device)** or a clockwise manual
+In **Settings > Advanced > Rotation**, choose **Automatic (device)** or a clockwise manual
 rotation of **0, 90, 180 or 270 degrees** relative to the received image.
 Automatic follows the orientation encoded in the incoming video, not the
 device's physical orientation sensor. Changes apply immediately to display and
-are saved when the application closes. Manual display rotation does not rotate
+are saved automatically. Manual display rotation does not rotate
 recorded video.
+
+Preferences are saved after changes settle for about half a second and again on
+normal shutdown. Diagnostics visibility, the window's normal size and position,
+maximized state, and recording folder, codec, encoder and bitrate are restored on
+the next launch. If a previously used monitor is unavailable, the window is
+placed on an available display. Recording does not start automatically.
 
 **Mirror Resolution** advertises a maximum stream box, not the sending device's
 native screen resolution. The device chooses the actual resolution and aspect
@@ -62,7 +79,8 @@ resolution. Reconnect the sender after changing the resolution.
 
 ## GPU decoding and display
 
-Enable **OPTIONS > Mirror Decoder > GPU decode**, then reconnect the sender.
+GPU acceleration is enabled by default. Change it in **Settings > Video decoder >
+Use GPU acceleration**, then reconnect the sender. Saved CPU preferences are preserved.
 Decoded D3D11 surfaces remain on the GPU through color conversion and display.
 The decoder and SDL renderer use the same graphics adapter, shared textures and
 GPU fences. Decoder surface views and render targets are reused, and the display

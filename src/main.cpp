@@ -17,6 +17,7 @@
 #include "net/socket.h"
 #include "settings.h"
 #include "platform/single_instance.h"
+#include "platform/firewall.h"
 #include "usb/usb_supervisor.h"
 #include "video/video_renderer.h"
 
@@ -78,6 +79,8 @@ ap::airplay::DeviceContext build_device_context(bool hls_playback) {
 
 int main(int argc, char** argv) {
 #if defined(_WIN32)
+    for (int i=1; i<argc; ++i)
+        if (std::string(argv[i])=="--configure-firewall") return ap::platform::configure_firewall();
     ap::platform::SingleInstance instance;
     // Help is read-only and should remain usable while the receiver is open.
     bool help_only = false;
@@ -239,6 +242,7 @@ int main(int argc, char** argv) {
     live_settings.fullscreen.store(saved.fullscreen);
     live_settings.chromeless.store(saved.chromeless);
     live_settings.video_rotation.store(saved.video_rotation);
+    live_settings.set_ui_preferences(saved.ui);
     ctx.live = &live_settings;
     LOG_INFO << "AirPlay Streaming HLS path: "
              << (hls_playback ? "ENABLED (--hls-proxy-playback)"
@@ -335,6 +339,9 @@ int main(int argc, char** argv) {
     usb_supervisor.start();
 
     LOG_INFO << "Ready. Close the window or press Ctrl-C to exit.";
+    auto last_saved_settings = ap::snapshot(live_settings);
+    auto observed_settings = last_saved_settings;
+    auto settings_changed_at = std::chrono::steady_clock::now();
     while (!g_stop && !renderer.user_closed()) {
 #if defined(_WIN32)
         if (instance.activation_requested()) renderer.request_show();
@@ -344,7 +351,6 @@ int main(int argc, char** argv) {
             mdns.stop();
             ctx.name = receiver_name;
             renderer.set_idle_info(ctx.name, display_ip);
-            ap::save_settings(ap::snapshot(live_settings));
             if (!mdns.start(ctx, server.port()))
                 LOG_WARN << "Could not advertise the new receiver name";
         }
@@ -365,6 +371,17 @@ int main(int argc, char** argv) {
         ap::video::VideoRenderer::DeviceInfo current_device;
         renderer.active_device_snapshot(current_device);
         renderer.set_audio_control_available(server.audio_control_available(current_device.session_id));
+        const auto current_settings = ap::snapshot(live_settings);
+        const auto settings_now = std::chrono::steady_clock::now();
+        if (!(current_settings == observed_settings)) {
+            observed_settings = current_settings;
+            settings_changed_at = settings_now;
+        }
+        if (!(current_settings == last_saved_settings) &&
+            settings_now - settings_changed_at >= std::chrono::milliseconds(500)) {
+            if (ap::save_settings(current_settings)) last_saved_settings = current_settings;
+            settings_changed_at = settings_now;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
@@ -376,8 +393,8 @@ int main(int argc, char** argv) {
     usb_supervisor.stop();
     hls_player.stop();
     hls_server.stop();
-    ap::save_settings(ap::snapshot(live_settings));
     renderer.stop();
+    ap::save_settings(ap::snapshot(live_settings));
     SDL_Quit();
     ap::net::global_shutdown();
     return 0;

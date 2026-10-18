@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(airplay-windows VERSION 0.3.0 LANGUAGES C CXX)
+project(airplay-windows VERSION 0.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -331,6 +331,7 @@ add_executable(airplay-windows
     src/video/video_recorder.cpp
     ${HLS_PLAYER_SRC}
     src/video/video_renderer.cpp
+    src/platform/firewall.cpp
     src/video/cover_art.cpp
     src/audio/audio_receiver.cpp
     src/audio/aac_decoder.cpp
@@ -417,7 +418,7 @@ if(WIN32)
     # VideoRenderer window.
     target_link_libraries(airplay-windows PRIVATE
         ws2_32 iphlpapi dnsapi dwmapi d3d11
-        setupapi shell32 ole32)   # USB enumeration + Lockdown directory lookup
+        setupapi shell32 ole32 oleaut32)   # USB, Lockdown lookup and firewall COM API
 
     # Released as a GUI app so no empty console window pops up when
     # launched from File Explorer. main() stays the entry point — the
@@ -484,6 +485,16 @@ endif()
 # Focused regression tests for receiver disconnect and shutdown.
 option(BUILD_NETWORK_TESTS "Build socket shutdown regression tests" OFF)
 if(BUILD_NETWORK_TESTS)
+    add_executable(test-firewall tools/test_firewall.cpp src/platform/firewall.cpp)
+    target_include_directories(test-firewall PRIVATE src)
+    if(WIN32)
+        target_link_libraries(test-firewall PRIVATE shell32 ole32 oleaut32)
+    endif()
+    add_executable(test-settings tools/test_settings.cpp src/settings.cpp src/log.cpp)
+    target_include_directories(test-settings PRIVATE src)
+    if(WIN32)
+        target_link_libraries(test-settings PRIVATE shell32 ole32)
+    endif()
     add_executable(test-cover-art tools/test_cover_art.cpp src/video/cover_art.cpp)
     target_include_directories(test-cover-art PRIVATE src ${FFMPEG_INCLUDE_DIRS_OK})
     target_link_libraries(test-cover-art PRIVATE ${FFMPEG_TARGETS})
@@ -504,6 +515,8 @@ if(BUILD_NETWORK_TESTS)
         target_link_libraries(test-shutdown PRIVATE Threads::Threads)
     endif()
     enable_testing()
+    add_test(NAME firewall COMMAND test-firewall)
+    add_test(NAME settings COMMAND test-settings)
     add_test(NAME socket-shutdown COMMAND test-shutdown)
     add_test(NAME audio-timing COMMAND test-audio-timing)
     add_test(NAME cover-art COMMAND test-cover-art)

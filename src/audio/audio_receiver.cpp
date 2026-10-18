@@ -6,9 +6,8 @@
 
 #include <chrono>
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
-#include <sstream>
+#include <iterator>
 
 #include <openssl/evp.h>
 
@@ -38,17 +37,6 @@ void set_recv_timeout(socket_t s, int ms) {
 #endif
 }
 
-std::string hex_dump(const unsigned char* b, std::size_t n, std::size_t max = 32) {
-    std::ostringstream os;
-    for (std::size_t i = 0; i < n && i < max; ++i) {
-        char tmp[4];
-        std::snprintf(tmp, sizeof(tmp), "%02x ", b[i]);
-        os << tmp;
-    }
-    if (n > max) os << "...(" << n << "B)";
-    return os.str();
-}
-
 } // namespace
 
 // RAOP compression-type values, from UxPlay/global.h and observed sessions.
@@ -67,7 +55,7 @@ const char* ct_name(int ct) {
 AudioReceiver::AudioReceiver()  = default;
 AudioReceiver::~AudioReceiver() { stop(); }
 
-bool AudioReceiver::start(Config cfg) {
+bool AudioReceiver::start(Config cfg, PauseState state) {
     if (cfg.data_sock == INVALID_SOCK || cfg.sample_rate <= 0) return false;
     if (cfg.aes_key.size() != 16 || cfg.aes_iv.size() != 16) {
         LOG_ERROR << "AudioReceiver: aes_key/aes_iv must be 16 B "
@@ -76,6 +64,13 @@ bool AudioReceiver::start(Config cfg) {
     }
 
     cfg_ = std::move(cfg);
+    if (cfg_.preserve_paused_audio && cfg_.synchronize && state.sample_rate == cfg_.sample_rate) {
+        paused_pcm_ = std::move(state.pcm);
+        paused_at_ns_ = state.paused_at_ns;
+        imported_pause_ = !paused_pcm_.empty();
+        output_ = std::move(state.output);
+        source_lead_frames_ = state.source_lead_frames;
+    }
 
     aes_ctx_ = EVP_CIPHER_CTX_new();
     if (!aes_ctx_ ||
@@ -104,7 +99,7 @@ bool AudioReceiver::start(Config cfg) {
 
     // SDL-backed audio sink. Goes live only if the OS gave us a device;
     // a headless Linux VM will fall back to silent decode-only mode.
-    if (decoder_) {
+    if (decoder_ && !output_) {
         output_ = std::make_unique<SdlAudioOutput>();
         if (!output_->start(cfg_.sample_rate, 2)) {
             LOG_WARN << "AudioReceiver: SDL audio output unavailable — "
@@ -131,7 +126,17 @@ void AudioReceiver::set_volume_db(float db) {
 
 void AudioReceiver::flush(std::optional<uint32_t> boundary) {
     std::lock_guard<std::mutex> lock(pcm_mutex_);
+    if (!boundary) imported_pause_ = false;
     const auto before = queued_samples_;
+    if (!imported_pause_) {
+        paused_pcm_.clear();
+        paused_at_ns_ = 0;
+    }
+    if (!imported_pause_ && cfg_.preserve_paused_audio && synchronize_ && boundary && !pcm_queue_.empty()) {
+        paused_pcm_ = pcm_queue_;
+        paused_at_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
     flush_boundary_ = boundary;
     if (!boundary) {
         pcm_queue_.clear();
@@ -150,6 +155,70 @@ void AudioReceiver::flush(std::optional<uint32_t> boundary) {
     pcm_cv_.notify_all();
 }
 
+void AudioReceiver::resume() {
+    std::lock_guard<std::mutex> lock(pcm_mutex_);
+    // A recreated stream has an unrelated RTP epoch. Its first real packet,
+    // rather than wall-clock elapsed time, provides the new boundary.
+    if (imported_pause_) return;
+    if (paused_pcm_.empty()) return;
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto elapsed = now - paused_at_ns_;
+    // Immediate FLUSH/audioMode pairs are buffer resets, not a user pause.
+    if (elapsed < 200'000'000LL || elapsed > 120'000'000'000LL || !synchronize_) {
+        paused_pcm_.clear();
+        return;
+    }
+    const auto shift = static_cast<uint32_t>(elapsed * cfg_.sample_rate / 1'000'000'000LL);
+    for (auto& frame : paused_pcm_) {
+        frame.rtp += shift;
+        frame.local_target_ns = 0;
+    }
+    const auto end = paused_pcm_.back().rtp + static_cast<uint32_t>(paused_pcm_.back().samples.size() / 2);
+    // The saved tail precedes newly transmitted audio. Suppress any overlap.
+    for (auto it = pcm_queue_.begin(); it != pcm_queue_.end();) {
+        trim_before(it->rtp, it->samples, end);
+        if (it->samples.empty()) it = pcm_queue_.erase(it); else ++it;
+    }
+    pcm_queue_.insert(pcm_queue_.begin(),
+        std::make_move_iterator(paused_pcm_.begin()), std::make_move_iterator(paused_pcm_.end()));
+    paused_pcm_.clear();
+    queued_samples_ = 0;
+    for (const auto& frame : pcm_queue_) queued_samples_ += frame.samples.size();
+    flush_boundary_ = end;
+    LOG_INFO << "Audio pause resume: pause_ms=" << elapsed / 1'000'000
+             << " restored_frames=" << queued_samples_ / 2 << " end_rtp=" << end;
+    pcm_cv_.notify_all();
+}
+
+void AudioReceiver::discard_pause() {
+    std::lock_guard<std::mutex> lock(pcm_mutex_);
+    paused_pcm_.clear();
+    imported_pause_ = false;
+}
+
+AudioReceiver::PauseState AudioReceiver::suspend() {
+    // Both workers access the sink. Join before moving its ownership.
+    if (running_.exchange(false)) {
+        pcm_cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+        if (playout_thread_.joinable()) playout_thread_.join();
+    }
+    PauseState state;
+    if (cfg_.preserve_paused_audio && synchronize_ && !paused_pcm_.empty()) {
+        state.pcm = std::move(paused_pcm_);
+        state.output = std::move(output_);
+        if (state.output) state.output->clear();
+        state.sample_rate = cfg_.sample_rate;
+        state.paused_at_ns = paused_at_ns_;
+        state.source_lead_frames = source_lead_frames_;
+        LOG_INFO << "Audio pause suspended: blocks=" << state.pcm.size()
+                 << " device_preserved=" << (state.output ? 1 : 0);
+    }
+    release_resources();
+    return state;
+}
+
 void AudioReceiver::set_synchronized(bool enabled) {
     if (synchronize_.exchange(enabled && cfg_.ntp) != (enabled && cfg_.ntp)) flush();
 }
@@ -159,6 +228,10 @@ void AudioReceiver::stop() {
     pcm_cv_.notify_all();
     if (thread_.joinable()) thread_.join();
     if (playout_thread_.joinable()) playout_thread_.join();
+    release_resources();
+}
+
+void AudioReceiver::release_resources() {
     if (cfg_.data_sock != INVALID_SOCK) ap::net::close_socket(cfg_.data_sock);
     cfg_.data_sock = INVALID_SOCK;
 
@@ -179,7 +252,6 @@ void AudioReceiver::thread_fn() {
     uint64_t total_bytes     = 0;
     uint64_t hist_0_16 = 0, hist_17_64 = 0, hist_65_256 = 0,
              hist_257_512 = 0, hist_513_plus = 0;
-    int big_pkts_logged = 0;
 
     // RAOP retransmits lost packets; iOS typically sends each seq 2-3 times
     // for resilience. We keep a bitset of recently-seen seqs so the decoder
@@ -236,6 +308,9 @@ void AudioReceiver::thread_fn() {
                     sync_rtp_ = be32(4);
                     sync_ntp_ = ntp;
                     have_anchor_ = ntp != 0;
+                    const uint32_t lead = be32(16) - be32(4);
+                    if (lead <= static_cast<uint32_t>(cfg_.sample_rate * 5))
+                        source_lead_frames_ = lead;
                 }
                 pcm_cv_.notify_all();
                 if (sync_packets <= 3 || sync_packets % 10 == 0)
@@ -263,6 +338,15 @@ void AudioReceiver::thread_fn() {
             continue;
         }
         if (n < 12) continue;   // RTP header minimum
+        if (!have_first_packet_) {
+            std::lock_guard<std::mutex> lock(pcm_mutex_);
+            first_packet_rtp_ = (static_cast<uint32_t>(buf[4]) << 24)
+                | (static_cast<uint32_t>(buf[5]) << 16)
+                | (static_cast<uint32_t>(buf[6]) << 8) | buf[7];
+            first_packet_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            have_first_packet_ = true;
+        }
 
         // Only count substantial packets (real audio) as proof of
         // active playback. During pause iOS keeps dribbling small
@@ -285,7 +369,6 @@ void AudioReceiver::thread_fn() {
         }
 
         // Parse RTP header (RFC 3550, 12-byte fixed part).
-        const uint8_t  pt  =  buf[1] & 0x7f;
         const uint16_t seq = (static_cast<uint16_t>(buf[2]) << 8) | buf[3];
         const uint32_t ts  = (static_cast<uint32_t>(buf[4]) << 24)
                            | (static_cast<uint32_t>(buf[5]) << 16)
@@ -345,22 +428,6 @@ void AudioReceiver::thread_fn() {
             }
         }
 
-        // Verbose log for the first couple of everything, AND for the first
-        // 5 non-duplicate "big enough to be real audio" packets. That's
-        // where the codec signature lives.
-        const bool first_any = (pkts <= 2);
-        const bool first_big = (real_audio && !is_duplicate && big_pkts_logged < 5);
-        if (first_any || first_big) {
-            LOG_INFO << "audio pkt#" << pkts << ": pt=" << static_cast<int>(pt)
-                     << " seq=" << seq << " ts=" << ts
-                     << " paylen=" << payload_len
-                     << " (enc=" << encrypted_len << " tail=" << tail_len
-                     << (is_duplicate ? " DUP" : "") << ')';
-            LOG_INFO << "  clear: " << hex_dump(cleartext,
-                                                static_cast<std::size_t>(outlen));
-            if (first_big) ++big_pkts_logged;
-        }
-
         // Feed the real-audio (non-duplicate) frames to the AAC decoder,
         // then immediately drain any PCM it produced into the SDL sink.
         if (real_audio && !is_duplicate && decoder_) {
@@ -395,6 +462,57 @@ void AudioReceiver::thread_fn() {
                             pcm_queue_.pop_front();
                         }
                         PcmFrame frame{pcm_rtp, std::vector<int16_t>(pcm, pcm + have)};
+                        // FLUSH can precede the last already-sent musical packets.
+                        // Retain their pre-boundary suffix rather than silently
+                        // losing a few milliseconds at the saved/live junction.
+                        if (!imported_pause_ && flush_boundary_ && !paused_pcm_.empty()) {
+                            const auto end = paused_pcm_.back().rtp +
+                                static_cast<uint32_t>(paused_pcm_.back().samples.size() / 2);
+                            auto drain = frame;
+                            trim_before(drain.rtp, drain.samples, end);
+                            const uint32_t remaining = *flush_boundary_ - drain.rtp;
+                            if (drain.rtp == end && remaining <= static_cast<uint32_t>(cfg_.sample_rate * 5)
+                                && !drain.samples.empty()) {
+                                if (drain.samples.size() / 2 > remaining)
+                                    drain.samples.resize(static_cast<std::size_t>(remaining) * 2);
+                                if (!drain.samples.empty()) paused_pcm_.push_back(std::move(drain));
+                            }
+                        }
+                        if (imported_pause_) {
+                            const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+                            if (now - paused_at_ns_ < 120'000'000'000LL && !paused_pcm_.empty()) {
+                                const uint32_t old_end = paused_pcm_.back().rtp +
+                                    static_cast<uint32_t>(paused_pcm_.back().samples.size() / 2);
+                                const uint32_t shift = frame.rtp - old_end;
+                                std::size_t retained_frames = 0;
+                                for (const auto& saved : paused_pcm_) retained_frames += saved.samples.size() / 2;
+                                // The old sender anchor reports its transmission lead.
+                                // Align the saved tail's end with the estimated live
+                                // deadline, allowing one device buffer for network
+                                // jitter. This keeps the splice fed while the new
+                                // stream's first RTCP anchor is still outstanding.
+                                const int64_t packet_delta = static_cast<int32_t>(frame.rtp - first_packet_rtp_);
+                                const int64_t fresh_estimate = first_packet_ns_
+                                    + (packet_delta + source_lead_frames_) * 1'000'000'000LL / cfg_.sample_rate;
+                                const int64_t tail_duration = static_cast<int64_t>(retained_frames)
+                                    * 1'000'000'000LL / cfg_.sample_rate;
+                                const int64_t device_margin = output_ ? output_->pending_ns() : 0;
+                                int64_t retained_target = std::max(now, fresh_estimate - tail_duration + device_margin);
+                                for (auto& saved : paused_pcm_) {
+                                    saved.rtp += shift;
+                                    saved.local_target_ns = retained_target;
+                                    retained_target += static_cast<int64_t>(saved.samples.size() / 2)
+                                        * 1'000'000'000LL / cfg_.sample_rate;
+                                    queued_samples_ += saved.samples.size();
+                                    pcm_queue_.push_back(std::move(saved));
+                                }
+                                LOG_INFO << "Audio pause restored across stream: frames=" << queued_samples_ / 2
+                                         << " new_rtp=" << frame.rtp;
+                            }
+                            paused_pcm_.clear();
+                            imported_pause_ = false;
+                        }
                         if (flush_boundary_) trim_before(frame.rtp, frame.samples, *flush_boundary_);
                         if (!frame.samples.empty()) {
                             // Boundary reached; normal duplicate/late handling
@@ -457,7 +575,9 @@ void AudioReceiver::playout_fn() {
         }
 
         std::optional<int64_t> target;
-        if (synchronize_ && cfg_.ntp && have_anchor_) {
+        if (pcm_queue_.front().local_target_ns) {
+            target = pcm_queue_.front().local_target_ns;
+        } else if (synchronize_ && cfg_.ntp && have_anchor_) {
             target = cfg_.ntp->local_time_ns(sync_ntp_);
             if (target) {
                 const uint32_t ticks = pcm_queue_.front().rtp - sync_rtp_;

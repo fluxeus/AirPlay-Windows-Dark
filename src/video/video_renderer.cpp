@@ -2,10 +2,12 @@
 #include "video/video_recorder.h"
 #include "video/gpu_video.h"
 #include "video/cover_art.h"
+#include "video/receiver_ui.h"
 #include "airplay/live_settings.h"
 #include "airplay/receiver_name.h"
 #include "log.h"
 #include "platform/single_instance.h"
+#include "platform/firewall.h"
 
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -47,15 +49,17 @@ extern "C" {
 namespace ap::video {
 namespace {
 
-// Match the design mockup's 1380x880 reference. The right panel
-// collapses on demand so a portrait phone stream still gets a tall
-// stage when the user shrinks the window.
-constexpr int kDefaultWinWidth  = 1280;
-constexpr int kDefaultWinHeight = 880;
-constexpr int kSidebarWidth     = 280;
+// Keep the stage spacious; settings occupy a drawer only when requested.
+constexpr int kDefaultWinWidth  = 1220;
+constexpr int kDefaultWinHeight = 800;
+constexpr int kSidebarWidth     = 190;
 constexpr int kOptionsWidth     = 380;
 constexpr int kStatusBarHeight  = 28;
-constexpr int kToolbarHeight    = 40;
+constexpr int kToolbarHeight    = 45;
+constexpr const char* kRotationModes[] = {
+    "Automatic (device)", "Manual: 0 degrees", "Manual: 90 degrees",
+    "Manual: 180 degrees", "Manual: 270 degrees"
+};
 
 #if defined(_WIN32)
 // Enable the Windows 11 Mica system backdrop on an SDL-owned window.
@@ -130,34 +134,34 @@ bool browse_recording_folder(SDL_Window* w, const std::string& initial,
 void enable_mica_backdrop(SDL_Window*) {}
 #endif
 
-// Minimal "OBS-ish" dark palette for the overlay. We tweak the full
-// theme later; this just moves the default ImGui colours into a style
-// that reads as part of the receiver window rather than a pale demo.
+// Calm, light palette shared by the receiver views and settings drawer.
 void apply_overlay_theme() {
-    ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding  = 8.0f;
-    s.FrameRounding   = 4.0f;
-    s.GrabRounding    = 4.0f;
-    s.ScrollbarRounding = 6.0f;
-    s.WindowPadding   = ImVec2(12, 10);
-    s.FramePadding    = ImVec2(8, 4);
-    s.ItemSpacing     = ImVec2(8, 6);
-
-    ImVec4* c = s.Colors;
-    c[ImGuiCol_WindowBg]        = ImVec4(0.10f, 0.11f, 0.13f, 0.85f);
-    c[ImGuiCol_Border]          = ImVec4(0.22f, 0.23f, 0.26f, 0.60f);
-    c[ImGuiCol_Text]            = ImVec4(0.92f, 0.93f, 0.95f, 1.00f);
-    c[ImGuiCol_TextDisabled]    = ImVec4(0.55f, 0.57f, 0.60f, 1.00f);
-    c[ImGuiCol_FrameBg]         = ImVec4(0.16f, 0.17f, 0.20f, 1.00f);
-    c[ImGuiCol_FrameBgHovered]  = ImVec4(0.22f, 0.23f, 0.26f, 1.00f);
-    c[ImGuiCol_FrameBgActive]   = ImVec4(0.28f, 0.30f, 0.34f, 1.00f);
-    c[ImGuiCol_Button]          = ImVec4(0.20f, 0.22f, 0.26f, 1.00f);
-    c[ImGuiCol_ButtonHovered]   = ImVec4(0.26f, 0.28f, 0.33f, 1.00f);
-    c[ImGuiCol_ButtonActive]    = ImVec4(0.34f, 0.36f, 0.42f, 1.00f);
-    c[ImGuiCol_Header]          = ImVec4(0.18f, 0.20f, 0.24f, 1.00f);
-    c[ImGuiCol_HeaderHovered]   = ImVec4(0.24f, 0.26f, 0.30f, 1.00f);
-    c[ImGuiCol_HeaderActive]    = ImVec4(0.30f, 0.33f, 0.38f, 1.00f);
-    c[ImGuiCol_Separator]       = ImVec4(0.30f, 0.32f, 0.36f, 0.55f);
+    ImGui::StyleColorsLight();
+    auto& s = ImGui::GetStyle();
+    s.WindowRounding = 0;
+    s.WindowBorderSize = 0;
+    s.FrameRounding = 8;
+    s.PopupRounding = 8;
+    s.GrabRounding = 8;
+    s.WindowPadding = ImVec2(20, 20);
+    s.FrameBorderSize = 1;
+    s.ScrollbarSize = 10;
+    s.FramePadding = ImVec2(12, 8);
+    s.ItemSpacing = ImVec2(10, 12);
+    auto* c = s.Colors;
+    c[ImGuiCol_WindowBg] = ImVec4(1, 1, 1, 1);
+    c[ImGuiCol_Text] = ImVec4(.125f, .149f, .161f, 1);
+    c[ImGuiCol_TextDisabled] = ImVec4(.45f, .48f, .50f, 1);
+    c[ImGuiCol_Border] = ImVec4(.90f, .91f, .90f, 1);
+    c[ImGuiCol_Separator] = c[ImGuiCol_Border];
+    c[ImGuiCol_FrameBg] = ImVec4(.988f, .992f, .984f, 1);
+    c[ImGuiCol_Button] = ImVec4(.988f, .992f, .984f, 1);
+    c[ImGuiCol_ButtonHovered] = ImVec4(.87f, .91f, .97f, 1);
+    c[ImGuiCol_ButtonActive] = ImVec4(.80f, .86f, .96f, 1);
+    c[ImGuiCol_Header] = ImVec4(1, 1, 1, 1);
+    c[ImGuiCol_HeaderHovered] = c[ImGuiCol_ButtonHovered];
+    c[ImGuiCol_HeaderActive] = c[ImGuiCol_ButtonActive];
+    c[ImGuiCol_PlotHistogram] = ImVec4(.14f, .40f, .92f, 1);
 }
 
 void copy_plane(std::vector<unsigned char>& dst,
@@ -182,23 +186,28 @@ namespace {
 // owns SDL events.
 struct UiState {
     bool chromeless = false;
+    bool settings_open = false;
+    bool diagnostics = false;
+    int page = 0;
+    bool was_connected = false;
 };
 
-// Hit-test for the borderless chromeless window: edges are resize
-// handles, the rest is draggable. When chrome is visible (normal
-// mode) the SDL window has its own title bar so we fall through to
-// HITTEST_NORMAL and let ImGui see the events.
+// Both layouts use a custom title bar. Keep native resize handles at
+// the edges; only the title bar (or the chromeless stage) is draggable.
 SDL_HitTestResult SDLCALL hit_test_cb(SDL_Window* w,
                                       const SDL_Point* p,
                                       void* data) {
     auto* ui = reinterpret_cast<UiState*>(data);
     int win_w = 0, win_h = 0;
     SDL_GetWindowSize(w, &win_w, &win_h);
-    constexpr int B = 6;        // edge thickness (in window pixels)
-    const bool top    = p->y < B;
-    const bool bottom = p->y > win_h - B;
-    const bool left   = p->x < B;
-    const bool right  = p->x > win_w - B;
+    const Uint32 flags = SDL_GetWindowFlags(w);
+    if (flags & SDL_WINDOW_FULLSCREEN) return SDL_HITTEST_NORMAL;
+    const int B = ui && ui->chromeless ? 10 : 6;
+    const bool resizable = !(flags & SDL_WINDOW_MAXIMIZED);
+    const bool top    = resizable && p->y < B;
+    const bool bottom = resizable && p->y >= win_h - B;
+    const bool left   = resizable && p->x < B;
+    const bool right  = resizable && p->x >= win_w - B;
     if (top    && left)  return SDL_HITTEST_RESIZE_TOPLEFT;
     if (top    && right) return SDL_HITTEST_RESIZE_TOPRIGHT;
     if (bottom && left)  return SDL_HITTEST_RESIZE_BOTTOMLEFT;
@@ -207,7 +216,8 @@ SDL_HitTestResult SDLCALL hit_test_cb(SDL_Window* w,
     if (bottom)          return SDL_HITTEST_RESIZE_BOTTOM;
     if (left)            return SDL_HITTEST_RESIZE_LEFT;
     if (right)           return SDL_HITTEST_RESIZE_RIGHT;
-    if (ui && ui->chromeless) return SDL_HITTEST_DRAGGABLE;
+    if (ui && (ui->chromeless || (p->y < kToolbarHeight && p->x < win_w - 144)))
+        return SDL_HITTEST_DRAGGABLE;
     return SDL_HITTEST_NORMAL;
 }
 
@@ -734,11 +744,41 @@ void VideoRenderer::run(const std::string& title) {
     // output a hard "blocky" look compared to Apple-certified
     // receivers. Must be set before SDL_CreateRenderer to take effect.
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+#if defined(_WIN32)
+    // SDL otherwise omits WS_THICKFRAME for borderless windows, which
+    // prevents Windows from resizing them despite the hit-test handles.
+    SDL_SetHint("SDL_BORDERLESS_RESIZABLE_STYLE", "1");
+#endif
 
+    auto preferences = live_settings_ ? live_settings_->ui_preferences() : ap::UiPreferences{};
+    int initial_x = SDL_WINDOWPOS_CENTERED, initial_y = SDL_WINDOWPOS_CENTERED;
+    int initial_w = kDefaultWinWidth, initial_h = kDefaultWinHeight;
+    if (preferences.window_placement_valid) {
+        initial_w = preferences.window_width;
+        initial_h = preferences.window_height;
+        SDL_Rect available{};
+        bool found = false;
+        for (int display = 0; display < SDL_GetNumVideoDisplays(); ++display) {
+            SDL_Rect bounds{};
+            if (SDL_GetDisplayUsableBounds(display, &bounds) != 0) continue;
+            // Require a reachable title bar, including on displays with negative coordinates.
+            if (preferences.window_y >= bounds.y && preferences.window_y + kToolbarHeight <= bounds.y + bounds.h &&
+                preferences.window_x + 100 <= bounds.x + bounds.w && preferences.window_x + initial_w - 100 >= bounds.x) {
+                available = bounds; found = true; break;
+            }
+        }
+        if (found || SDL_GetDisplayUsableBounds(0, &available) == 0) {
+            initial_w = std::min(initial_w, available.w);
+            initial_h = std::min(initial_h, available.h);
+            initial_x = found ? std::clamp(preferences.window_x, available.x, available.x + available.w - initial_w)
+                              : available.x + (available.w - initial_w) / 2;
+            initial_y = found ? std::clamp(preferences.window_y, available.y, available.y + available.h - initial_h)
+                              : available.y + (available.h - initial_h) / 2;
+        }
+    }
     SDL_Window*   window   = SDL_CreateWindow(
-        title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        kDefaultWinWidth, kDefaultWinHeight,
-        SDL_WINDOW_RESIZABLE);
+        title.c_str(), initial_x, initial_y, initial_w, initial_h,
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS);
     // Read the initial vsync preference from LiveSettings (default
     // true). Toggling at runtime is handled by SDL_RenderSetVSync
     // below in the render loop.
@@ -764,6 +804,7 @@ void VideoRenderer::run(const std::string& title) {
     }
     LOG_INFO << "VideoRenderer window up (" << kDefaultWinWidth
              << 'x' << kDefaultWinHeight << ", resizable)";
+    SDL_SetWindowMinimumSize(window, 960, 720);
 
     GpuVideo gpu_video;
 #if defined(_WIN32)
@@ -795,6 +836,27 @@ void VideoRenderer::run(const std::string& title) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
     apply_overlay_theme();
+    ImFont* heading_font = nullptr;
+    ImFont* bold_font = nullptr;
+    ImFont* small_font = nullptr;
+    ImFont* page_font = nullptr;
+    ImFont* receiver_font = nullptr;
+#if defined(_WIN32)
+    if (std::filesystem::exists("C:/Windows/Fonts/segoeui.ttf")) {
+        io.FontDefault = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/segoeui.ttf", 18.0f);
+        heading_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/seguisb.ttf", 42.0f);
+        bold_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/seguisb.ttf", 18.0f);
+        page_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/seguisb.ttf", 28.0f);
+        small_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/segoeui.ttf", 16.0f);
+        receiver_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/seguisb.ttf", 22.0f);
+    }
+#endif
+    if (!io.FontDefault) io.FontDefault = io.Fonts->AddFontDefault();
+    if (!bold_font) bold_font = io.FontDefault;
+    if (!small_font) small_font = io.FontDefault;
+    if (!heading_font) heading_font = io.FontDefault;
+    if (!page_font) page_font = bold_font;
+    if (!receiver_font) receiver_font = bold_font;
     ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer2_Init(renderer);
 
@@ -813,6 +875,10 @@ void VideoRenderer::run(const std::string& title) {
     if (TTF_Init() == 0) {
         fonts_big   = open_font_chain(32);
         fonts_small = open_font_chain(20);
+        if (TTF_Font* semibold = TTF_OpenFont("C:/Windows/Fonts/seguisb.ttf",32)) {
+            if (!fonts_big.empty()) { TTF_CloseFont(fonts_big.front()); fonts_big.front()=semibold; }
+            else fonts_big.push_back(semibold);
+        }
     } else {
         LOG_WARN << "TTF_Init failed: " << TTF_GetError();
     }
@@ -852,9 +918,12 @@ void VideoRenderer::run(const std::string& title) {
     // resizable window. F11 / double-click toggle real fullscreen,
     // H toggles chromeless, ESC peels back layers.
     UiState ui;
+    ui.diagnostics = preferences.diagnostics;
     if (live_settings_)
         ui.chromeless = live_settings_->chromeless.load(std::memory_order_relaxed);
-    SDL_SetWindowHitTest(window, hit_test_cb, &ui);
+    if (SDL_SetWindowHitTest(window, hit_test_cb, &ui) != 0)
+        LOG_WARN << "Window resize hit-test unavailable: " << SDL_GetError();
+    if (ui.chromeless) SDL_SetWindowMinimumSize(window, 160, 120);
 
     std::array<char, 1024> recording_dir{};
     std::array<char, 51> receiver_name_buf{};
@@ -862,9 +931,12 @@ void VideoRenderer::run(const std::string& title) {
         std::snprintf(receiver_name_buf.data(), receiver_name_buf.size(), "%s",
                       live_settings_->receiver_name().c_str());
     VideoRecorder::Options recording_options;
+    recording_options.codec = static_cast<VideoRecorder::VideoCodec>(preferences.recording_codec);
+    recording_options.encoder = static_cast<VideoRecorder::EncoderMode>(preferences.recording_encoder);
+    recording_options.bitrate_mbps = preferences.recording_bitrate;
     const std::string default_recording_dir = VideoRecorder::default_directory();
     std::snprintf(recording_dir.data(), recording_dir.size(), "%s",
-                  default_recording_dir.c_str());
+                  preferences.recording_directory.empty() ? default_recording_dir.c_str() : preferences.recording_directory.c_str());
     auto toggle_recording = [&]() {
         if (!recorder_) return;
         if (recorder_->status().recording) recorder_->stop();
@@ -884,24 +956,38 @@ void VideoRenderer::run(const std::string& title) {
     if (fullscreen) {
         SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
         SDL_ShowCursor(SDL_DISABLE);
+    } else if (!ui.chromeless && preferences.window_maximized) {
+        SDL_MaximizeWindow(window);
     }
 
-    // Track the SDL-side window border state so we only call the
-    // SDL_SetWindowBordered API on actual transitions. In chromeless
-    // mode the OS title bar is hidden too — otherwise the user's
-    // "vierge" expectation isn't met. The window stays resizable
-    // via the SDL hit-test callback (edges = resize handles, video
-    // area = drag handle).
-    bool sdl_bordered = true;
+    auto publish_preferences = [&]() {
+        auto current = preferences;
+        current.diagnostics = ui.diagnostics;
+        current.recording_directory = recording_dir.data();
+        current.recording_codec = static_cast<int>(recording_options.codec);
+        current.recording_encoder = static_cast<int>(recording_options.encoder);
+        current.recording_bitrate = recording_options.bitrate_mbps;
+        const Uint32 flags = SDL_GetWindowFlags(window);
+        if (!fullscreen && !ui.chromeless && !(flags & SDL_WINDOW_MINIMIZED)) {
+            current.window_maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
+            if (!current.window_maximized) {
+                SDL_GetWindowPosition(window, &current.window_x, &current.window_y);
+                SDL_GetWindowSize(window, &current.window_width, &current.window_height);
+                current.window_placement_valid = true;
+            }
+        }
+        if (!(current == preferences)) {
+            preferences = current;
+            if (live_settings_) live_settings_->set_ui_preferences(current);
+        }
+    };
 
     // Chromeless aspect-lock state. Triggers a re-snap on:
     //   - chromeless toggled on
     //   - video frame dimensions change (iPhone rotation, e.g.
     //     portrait <-> landscape mid-mirror)
     //   - user resize via the hit-test edges
-    // The ignore-next-resize flag breaks the feedback loop our own
-    // SDL_SetWindowSize would otherwise cause. saved_w/h capture the
-    // chrome-mode window size before entering chromeless so we can
+    // saved_w/h capture the chrome-mode window size before entering chromeless so we can
     // restore it on exit (otherwise the menus get crushed against a
     // tall narrow video-aspect window).
     bool prev_chromeless    = false;
@@ -909,7 +995,52 @@ void VideoRenderer::run(const std::string& title) {
     int  prev_video_h       = 0;
     int  saved_window_w     = 0;
     int  saved_window_h     = 0;
-    bool ignore_next_resize = false;
+    bool saved_window_maximized = false;
+    bool custom_resolution = false;
+    double settings_reset_notice_until = 0;
+
+    auto reset_all_settings = [&]() {
+        if (!live_settings_) return;
+        const ap::PersistentSettings defaults;
+        int mirror_w = 2560, mirror_h = 1440;
+        SDL_DisplayMode display{};
+        if (SDL_GetCurrentDisplayMode(0, &display) == 0 &&
+            display.w >= 320 && display.h >= 240 && display.w <= 7680 && display.h <= 4320) {
+            mirror_w = display.w;
+            mirror_h = display.h;
+        }
+        live_settings_->set_receiver_name(defaults.receiver_name);
+        live_settings_->mirror_width.store(mirror_w);
+        live_settings_->mirror_height.store(mirror_h);
+        live_settings_->hevc_enabled.store(defaults.hevc_enabled);
+        live_settings_->max_fps.store(defaults.max_fps);
+        live_settings_->refresh_rate.store(defaults.refresh_rate);
+        live_settings_->mirror_hwaccel.store(defaults.mirror_hwaccel);
+        live_settings_->vsync_enabled.store(defaults.vsync_enabled);
+        live_settings_->video_rotation.store(defaults.video_rotation);
+        live_settings_->fullscreen.store(defaults.fullscreen);
+        live_settings_->chromeless.store(defaults.chromeless);
+        preferences = defaults.ui;
+        live_settings_->set_ui_preferences(preferences);
+        std::snprintf(receiver_name_buf.data(),receiver_name_buf.size(),"%s",defaults.receiver_name.c_str());
+        std::snprintf(recording_dir.data(),recording_dir.size(),"%s",default_recording_dir.c_str());
+        recording_options = VideoRecorder::Options{};
+        ui.diagnostics = defaults.ui.diagnostics;
+        ui.chromeless = false;
+        custom_resolution = false;
+        prev_chromeless = false;
+        saved_window_w = saved_window_h = 0;
+        fullscreen = false;
+        SDL_SetWindowFullscreen(window,0);
+        SDL_ShowCursor(SDL_ENABLE);
+        SDL_RestoreWindow(window);
+        SDL_SetWindowMinimumSize(window,960,720);
+        saved_window_maximized = false;
+        SDL_SetWindowSize(window,defaults.ui.window_width,defaults.ui.window_height);
+        SDL_SetWindowPosition(window,SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED);
+        publish_preferences();
+        settings_reset_notice_until = ImGui::GetTime()+4;
+    };
 
     // iOS sends upright frames with updated dimensions when it rotates.
     // Auto must not apply another 90 degrees to an already upright image.
@@ -926,9 +1057,8 @@ void VideoRenderer::run(const std::string& title) {
 
     // "Shrink to fit" snap: collapse the dimension that exceeds the
     // target aspect, leave the other one alone. Used on chromeless
-    // entry (so the new window fits inside the previous chrome
-    // window's bounds) and on user edge-drag (so the user's drag is
-    // mostly preserved). Tolerates +-1 px to dodge OS rounding loops.
+    // entry so the new window fits inside the previous chrome window's
+    // bounds. Manual resizing stays free; fit_inside preserves video aspect.
     auto snap_to_video_aspect = [&]() {
         if (!ui.chromeless || fullscreen) return;
         if (video_tex_w <= 0 || video_tex_h <= 0) return;
@@ -944,7 +1074,6 @@ void VideoRenderer::run(const std::string& title) {
             snap_h = static_cast<int>(wnow / vid_a + 0.5f);
         }
         if (std::abs(snap_w - wnow) > 1 || std::abs(snap_h - hnow) > 1) {
-            ignore_next_resize = true;
             SDL_SetWindowSize(window, snap_w, snap_h);
         }
     };
@@ -973,11 +1102,11 @@ void VideoRenderer::run(const std::string& title) {
             new_w = static_cast<int>(long_dim * vid_a + 0.5f);
         }
         if (std::abs(new_w - wnow) > 1 || std::abs(new_h - hnow) > 1) {
-            ignore_next_resize = true;
             SDL_SetWindowSize(window, new_w, new_h);
         }
     };
 
+    ap::platform::FirewallMonitor firewall_monitor;
     while (running_.load()) {
         if (show_requested_.exchange(false)) {
             SDL_ShowWindow(window);
@@ -989,18 +1118,6 @@ void VideoRenderer::run(const std::string& title) {
                 SetForegroundWindow(instance_window_info.info.win.window);
 #endif
         }
-        // Sync the SDL window border to the chromeless toggle. In
-        // fullscreen the border is irrelevant (SDL handles it via
-        // the fullscreen flag). Otherwise: borderless when the user
-        // wants a clean "video only" look, bordered the rest of the
-        // time so they can drag/close via the title bar.
-        const bool want_bordered = !(ui.chromeless && !fullscreen);
-        if (want_bordered != sdl_bordered) {
-            SDL_SetWindowBordered(window,
-                                  want_bordered ? SDL_TRUE : SDL_FALSE);
-            sdl_bordered = want_bordered;
-        }
-
         // Re-snap the window aspect on either of:
         //   - chromeless flipping on (snap once on entry)
         //   - video dimensions changing while chromeless (iPhone
@@ -1013,15 +1130,18 @@ void VideoRenderer::run(const std::string& title) {
             ui.chromeless &&
             (display_width() != prev_video_w || display_height() != prev_video_h);
         if (ui.chromeless != prev_chromeless) {
+            SDL_SetWindowMinimumSize(window, ui.chromeless ? 160 : 960, ui.chromeless ? 120 : 720);
             if (ui.chromeless && !fullscreen) {
+                saved_window_maximized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
+                if (saved_window_maximized) SDL_RestoreWindow(window);
                 SDL_GetWindowSize(window,
                                   &saved_window_w, &saved_window_h);
                 snap_to_video_aspect();
             } else if (!ui.chromeless &&
                        saved_window_w > 0 && saved_window_h > 0) {
-                ignore_next_resize = true;
                 SDL_SetWindowSize(window,
                                   saved_window_w, saved_window_h);
+                if (saved_window_maximized) SDL_MaximizeWindow(window);
             }
             prev_chromeless = ui.chromeless;
             if (live_settings_)
@@ -1063,16 +1183,25 @@ void VideoRenderer::run(const std::string& title) {
                 running_ = false;
                 break;
             }
-            // When ImGui has keyboard / mouse capture (user interacting with
-            // the overlay), don't let the native shortcuts steal the input.
             const ImGuiIO& io_poll = ImGui::GetIO();
-            if (e.type == SDL_KEYDOWN && !io_poll.WantCaptureKeyboard) {
+            // A focused panel captures navigation keys even when no field is
+            // being edited. Keep receiver shortcuts global in that case;
+            // text fields retain letters and modified key combinations.
+            const bool receiver_shortcut = e.type == SDL_KEYDOWN &&
+                (e.key.keysym.sym == SDLK_f || e.key.keysym.sym == SDLK_F11 ||
+                 e.key.keysym.sym == SDLK_h || e.key.keysym.sym == SDLK_r);
+            const bool allow_keyboard = receiver_shortcut
+                ? !io_poll.WantTextInput &&
+                  !(e.key.keysym.mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI))
+                : !io_poll.WantCaptureKeyboard;
+            if (e.type == SDL_KEYDOWN && !e.key.repeat && allow_keyboard) {
                 switch (e.key.keysym.sym) {
                     case SDLK_ESCAPE:
                         // ESC peels back layers in order:
                         // fullscreen first, then chromeless, then quit.
                         if (fullscreen)         toggle_fullscreen();
                         else if (ui.chromeless) ui.chromeless = false;
+                        else if (ui.settings_open) ui.settings_open = false;
                         else { closed_ = true; running_ = false; }
                         break;
                     case SDLK_f:
@@ -1094,17 +1223,6 @@ void VideoRenderer::run(const std::string& title) {
                 !io_poll.WantCaptureMouse) {
                 toggle_fullscreen();
             }
-            // Aspect-lock on user resize while chromeless. The flag
-            // dodges the feedback loop our own SDL_SetWindowSize call
-            // inside snap_to_video_aspect would cause.
-            if (e.type == SDL_WINDOWEVENT &&
-                e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                if (ignore_next_resize) {
-                    ignore_next_resize = false;
-                } else {
-                    snap_to_video_aspect();
-                }
-            }
         }
         if (!running_.load()) break;
 
@@ -1121,9 +1239,14 @@ void VideoRenderer::run(const std::string& title) {
         DecodedFrame avf_local;
         int w = 0, h = 0;
         int64_t frame_origin_ns_local = 0;
+        DeviceInfo pacing_device;
+        const bool audio_only = active_device_snapshot(pacing_device) && pacing_device.kind == "Audio";
+        // Audio controls/progress need fewer redraws than mirrored video.
+        // A newly queued video frame still wakes this wait immediately.
+        const auto refresh_wait = std::chrono::milliseconds(audio_only ? 33 : 16);
         {
             std::unique_lock<std::mutex> lock(mtx_);
-            cv_.wait_for(lock, std::chrono::milliseconds(16),
+            cv_.wait_for(lock, refresh_wait,
                          [this] {
                              return has_avframe_ || has_frame_ ||
                                     cover_dirty_ || !running_.load();
@@ -1340,9 +1463,13 @@ void VideoRenderer::run(const std::string& title) {
         // Both collapse all insets to 0 so the video stage covers the
         // whole window, and both skip the ImGui panel block below.
         const bool no_chrome = fullscreen || ui.chromeless;
-        const int options_w     = no_chrome ? 0 : kOptionsWidth;
+        const auto firewall=firewall_monitor.status();
+        const bool firewall_notice=firewall.state!=ap::platform::FirewallState::Checking &&
+            firewall.state!=ap::platform::FirewallState::Allowed;
+        const int firewall_offset=firewall_notice ? (firewall.message.empty()?124:150) : 0;
+        const int options_w     = 0; // Settings overlay the content, as in the approved design.
         const int chrome_top    = no_chrome ? 0 : kToolbarHeight;
-        const int chrome_bottom = no_chrome ? 0 : kStatusBarHeight;
+        const int chrome_bottom = no_chrome || !ui.diagnostics ? 0 : kStatusBarHeight;
         const int chrome_left   = no_chrome ? 0 : kSidebarWidth;
         const int stage_x = chrome_left;
         const int stage_y = chrome_top;
@@ -1360,9 +1487,13 @@ void VideoRenderer::run(const std::string& title) {
         // then clip subsequent SDL draws to the stage rect via
         // viewport — the ImGui panels will paint over the cleared
         // sides afterwards.
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_SetRenderDrawColor(renderer, no_chrome ? 0 : 245, no_chrome ? 0 : 246, no_chrome ? 0 : 244, 255);
         SDL_RenderClear(renderer);
-        const SDL_Rect stage_rect{stage_x, stage_y, stage_w, stage_h};
+        const bool framed_video = !no_chrome && show_video;
+        const SDL_Rect stage_rect{stage_x + (framed_video ? 42 : 0), stage_y + (framed_video ? 96 + firewall_offset : 0),
+                                  std::max(1, stage_w - (framed_video ? 84 : 0)), std::max(1, stage_h - (framed_video ? 156 + firewall_offset : 0))};
+        win_w = stage_rect.w;
+        win_h = stage_rect.h;
         SDL_RenderSetViewport(renderer, &stage_rect);
 
         auto draw_pause_badge = [&](const SDL_Rect& dst) {
@@ -1396,6 +1527,8 @@ void VideoRenderer::run(const std::string& title) {
             (!has_active_dev || active_dev.kind != "Mirror");
 
         if (show_video) {
+            SDL_SetRenderDrawColor(renderer, 23, 30, 34, 255);
+            SDL_RenderFillRect(renderer, nullptr);
             const int angle = rotation_degrees();
             SDL_Rect dst = fit_inside(display_width(), display_height(), win_w, win_h);
             // SDL rotates the destination rectangle around its centre. Swap
@@ -1412,7 +1545,7 @@ void VideoRenderer::run(const std::string& title) {
             if (show_pause_badge) {
                 draw_pause_badge(dst);
             }
-        } else if (cover_tex) {
+        } else if (cover_tex && no_chrome) {
             // Cover art centered in the top 70% of the window; the bottom
             // strip holds the metadata text (title / artist / album).
             const int strip_h = std::min(win_h, std::max(win_h / 4, 230));
@@ -1443,7 +1576,7 @@ void VideoRenderer::run(const std::string& title) {
             draw_text(album_tex,  album_w,  album_h);
 
 
-        } else {
+        } else if (no_chrome) {
             // Idle: no mirror frame, no cover — show device info.
             auto draw_centered = [&](SDL_Texture* tex, int tw, int th, int y) {
                 if (!tex) return;
@@ -1479,15 +1612,62 @@ void VideoRenderer::run(const std::string& title) {
         const ImGuiWindowFlags kPanelFlags =
             ImGuiWindowFlags_NoCollapse  | ImGuiWindowFlags_NoMove        |
             ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoTitleBar    |
-            ImGuiWindowFlags_NoBringToFrontOnFocus |
+
             ImGuiWindowFlags_NoNavFocus  | ImGuiWindowFlags_NoSavedSettings;
 
-        const float status_bar_h = static_cast<float>(kStatusBarHeight);
+        const float status_bar_h = static_cast<float>(chrome_bottom);
         const float toolbar_h    = static_cast<float>(kToolbarHeight);
         const float side_bar_w   = static_cast<float>(kSidebarWidth);
-        const float opts_bar_w   = static_cast<float>(kOptionsWidth);
+        const float opts_bar_w   = static_cast<float>(std::min(kOptionsWidth, full_w / 2));
         const float fw           = static_cast<float>(full_w);
         const float fh           = static_cast<float>(full_h);
+
+        namespace ui_draw = receiver_ui;
+        auto draw_audio_controls = [&]() {
+            const bool ready = audio_control_available_.load();
+            const bool pending = audio_command_pending_.load();
+            const uint32_t total = progress_total_ms_.load();
+            uint64_t elapsed = progress_elapsed_ms_.load();
+            const int64_t pushed = progress_pushed_at_ns_.load();
+            if (playing_now && pushed > 0) {
+                const auto clock_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+                if (clock_ns > pushed) elapsed += (clock_ns - pushed) / 1000000;
+            }
+            elapsed = total > 0 ? std::min<uint64_t>(elapsed, total) : 0;
+            const float progress = total > 0 ? static_cast<float>(elapsed) / total : 0;
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            const float width = ImGui::GetContentRegionAvail().x;
+            auto* draw = ImGui::GetWindowDrawList();
+            draw->AddRectFilled(p,ImVec2(p.x+width,p.y+3),IM_COL32(225,229,223,255),2);
+            if (progress > 0) draw->AddRectFilled(p,ImVec2(p.x+width*progress,p.y+3),IM_COL32(87,106,89,255),2);
+            ImGui::Dummy(ImVec2(width,5));
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Playback position (read-only)");
+            ImGui::PushFont(small_font);
+            ImGui::TextDisabled("%u:%02u",static_cast<unsigned>(elapsed/60000),static_cast<unsigned>((elapsed/1000)%60));
+            char duration[32]; std::snprintf(duration,sizeof(duration),"%u:%02u",total/60000,(total/1000)%60);
+            ImGui::SameLine(); ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x-ImGui::CalcTextSize(duration).x);
+            ImGui::TextDisabled("%s",duration);
+            ImGui::PopFont();
+            ImGui::Dummy(ImVec2(0,5));
+            auto command = [&](ap::airplay::MediaCommand action) {
+                audio_command_failed_.store(false); audio_command_pending_.store(true); audio_control_handler_(action,0);
+            };
+            const ImVec2 row = ImGui::GetCursorPos();
+            ImGui::BeginDisabled(!ready || pending);
+            ImGui::SetCursorPos(ImVec2(row.x,row.y+10.5f));
+            if (ui_draw::icon_button("##previous",ui_draw::Icon::Previous,"Previous track",32)) command(ap::airplay::MediaCommand::Previous);
+            ImGui::SetCursorPos(ImVec2(row.x+51,row.y));
+            if (ui_draw::icon_button("##play",playing_now ? ui_draw::Icon::Pause : ui_draw::Icon::Play,playing_now ? "Pause" : "Play",53,true)) command(ap::airplay::MediaCommand::PlayPause);
+            ImGui::SetCursorPos(ImVec2(row.x+123,row.y+10.5f));
+            if (ui_draw::icon_button("##next",ui_draw::Icon::Next,"Next track",32)) command(ap::airplay::MediaCommand::Next);
+            ImGui::EndDisabled();
+            ImGui::SetCursorPos(ImVec2(row.x,row.y+65));
+            ImGui::PushFont(small_font);
+            if (pending) ImGui::TextDisabled("Sending command...");
+            else if (!ready) ImGui::TextDisabled("Remote control unavailable");
+            else if (audio_command_failed_.load()) ImGui::TextDisabled("Command failed or unsupported");
+            ImGui::PopFont();
+        };
 
         // Fullscreen and chromeless both hide the entire chrome
         // (toolbar / sidebar / options / status bar). Fullscreen also
@@ -1496,186 +1676,308 @@ void VideoRenderer::run(const std::string& title) {
         // video. F11/F/double-click toggles fullscreen, H toggles
         // chromeless, ESC peels back layers. The pulsing "Waiting
         // for AirPlay" ring stays drawn — it's part of the stage.
-        if (!fullscreen && !ui.chromeless) {
-        // ---- Top toolbar (app title + active device + actions) ----
-        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
-        ImGui::SetNextWindowSize(ImVec2(fw, toolbar_h));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 8));
-        if (ImGui::Begin("##toolbar", nullptr,
-                         kPanelFlags | ImGuiWindowFlags_NoScrollbar)) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(0.92f, 0.93f, 0.95f, 1.0f));
-            ImGui::TextUnformatted("AirPlay-Windows");
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            ImGui::TextDisabled(" | ");
-            ImGui::SameLine();
-            const bool video_recent =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - last_video_frame_time).count() < 1500;
-            ImDrawList* dl_tb = ImGui::GetWindowDrawList();
-            const ImVec2 dot_p = ImGui::GetCursorScreenPos();
-            const ImU32 dot_col = video_recent
-                ? IM_COL32(80, 220, 130, 230)     // streaming  : green
-                : (has_active_dev
-                    ? IM_COL32(220, 200, 90, 230) // paired-quiet: amber
-                    : IM_COL32(170, 170, 170, 180)); // idle     : grey
-            dl_tb->AddCircleFilled(ImVec2(dot_p.x + 6, dot_p.y + 9),
-                                   4.5f, dot_col);
-            ImGui::Dummy(ImVec2(16, 18));
-            ImGui::SameLine();
-            if (has_active_dev) {
-                const char* primary_tb =
-                    !active_dev.name.empty()    ? active_dev.name.c_str()
-                  : !active_dev.peer_ip.empty() ? active_dev.peer_ip.c_str()
-                  : "Device";
-                ImGui::Text("%s - %s", active_dev.kind.c_str(), primary_tb);
-            } else {
-                ImGui::TextDisabled("Idle - waiting for AirPlay");
-            }
-            // Right-aligned quick toggles. "Disconnect" only when
-            // there is actually something to disconnect. "Hide UI"
-            // collapses the entire chrome (this toolbar included)
-            // - bring it back with the H hotkey or ESC.
-            const float btn_disc_w = 110.0f;
-            const float btn_rec_w  = 84.0f;
-            const float btn_hide_w = 110.0f;
-            const float btn_full_w = 100.0f;
-            const float gap = 8.0f;
-            const bool  show_disc  = has_active_dev && disconnect_handler_;
-            const bool  is_recording = recorder_ && recorder_->status().recording;
-            const float row_w =
-                (show_disc ? btn_disc_w + gap : 0.0f) +
-                btn_rec_w + gap + btn_hide_w + gap + btn_full_w;
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(fw - row_w - 12.0f);
-            if (show_disc) {
-                if (ImGui::Button("Disconnect",
-                                  ImVec2(btn_disc_w, 0))) {
-                    disconnect_handler_();
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip(
-                        "End the current AirPlay session");
-                }
-                ImGui::SameLine();
-            }
-            if (is_recording) {
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                                      ImVec4(0.65f, 0.10f, 0.12f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                                      ImVec4(0.78f, 0.15f, 0.17f, 1.0f));
-            }
-            if (ImGui::Button(is_recording ? "Stop REC" : "REC",
-                              ImVec2(btn_rec_w, 0))) {
-                toggle_recording();
-            }
-            if (is_recording) ImGui::PopStyleColor(2);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Start/stop MP4 recording (R)");
-            ImGui::SameLine();
-            if (ImGui::Button("Hide UI", ImVec2(btn_hide_w, 0))) {
-                ui.chromeless = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Hide all panels (H or ESC to restore)");
-            }
-            ImGui::SameLine();
-            if (ImGui::Button(fullscreen ? "Exit fullscreen" : "Fullscreen",
-                              ImVec2(btn_full_w, 0))) {
-                toggle_fullscreen();
-            }
+        if (!no_chrome) {
+        if (has_active_dev && !ui.was_connected) ui.page = active_dev.kind == "Audio" ? 1 : 2;
+        if (!has_active_dev && ui.was_connected) ui.page = 0;
+        ui.was_connected = has_active_dev;
+        const char* receiver = receiver_name_buf.data();
+        const ImU32 ink = ui_draw::ink, muted = ui_draw::muted, line = ui_draw::line;
+        ImGui::SetNextWindowPos(ImVec2(0,0));
+        ImGui::SetNextWindowSize(ImVec2(fw,toolbar_h));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(20,0));
+        ImGui::Begin("##titlebar",nullptr,kPanelFlags|ImGuiWindowFlags_NoScrollbar);
+        auto* title_draw = ImGui::GetWindowDrawList();
+        ui_draw::icon(title_draw,ui_draw::Icon::Cast,ImVec2(20,12),20,ui_draw::blue);
+        title_draw->AddText(bold_font,16,ImVec2(50,12),ink,"AirPlay Windows");
+        title_draw->AddLine(ImVec2(0,44),ImVec2(fw,44),line);
+        ImGui::SetCursorPos(ImVec2(fw-144,0));
+        auto window_control = [&](const char* id, ui_draw::Icon kind) {
+            const ImVec2 pos=ImGui::GetCursorScreenPos();
+            const bool click=ui_draw::surface(id,ImVec2(48,44));
+            if (ImGui::IsItemHovered()) title_draw->AddRectFilled(pos,ImVec2(pos.x+48,pos.y+44),kind==ui_draw::Icon::Close ? IM_COL32(247,220,220,255) : IM_COL32(239,242,239,255));
+            ui_draw::icon(title_draw,kind,ImVec2(pos.x+14,pos.y+12),20,muted);
+            return click;
+        };
+        if (window_control("##minimize",ui_draw::Icon::Minimize)) SDL_MinimizeWindow(window);
+        ImGui::SameLine(0,0);
+        if (window_control("##maximize",ui_draw::Icon::Maximize)) {
+            if (SDL_GetWindowFlags(window)&SDL_WINDOW_MAXIMIZED) SDL_RestoreWindow(window); else SDL_MaximizeWindow(window);
         }
-        ImGui::End();
-        ImGui::PopStyleVar();
+        ImGui::SameLine(0,0);
+        if (window_control("##close",ui_draw::Icon::Close)) { SDL_Event event{}; event.type=SDL_QUIT; SDL_PushEvent(&event); }
+        ImGui::End(); ImGui::PopStyleVar();
 
-        // ---- Left sidebar : DEVICES -------------------------------
-        ImGui::SetNextWindowPos(ImVec2(0.0f, toolbar_h));
-        ImGui::SetNextWindowSize(ImVec2(side_bar_w, fh - toolbar_h - status_bar_h));
-        if (ImGui::Begin("##devices_sidebar", nullptr, kPanelFlags)) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(0.65f, 0.68f, 0.72f, 1.0f));
-            ImGui::TextUnformatted("DEVICES");
-            ImGui::PopStyleColor();
-            ImGui::Separator();
-            // Wrap to the panel width so long device names / model
-            // strings don't run off the right edge of the sidebar.
-            ImGui::PushTextWrapPos(0.0f);
-            const bool video_streaming =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - last_video_frame_time).count() < 1500;
-            if (has_active_dev) {
-                // Pulsing dot in front of the device name when the
-                // pipeline is actively producing frames; muted dot
-                // otherwise (paired but quiet).
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                const ImVec2 p = ImGui::GetCursorScreenPos();
-                const float t = video_streaming
-                    ? 0.55f + 0.45f * std::sin(
-                        static_cast<float>(ImGui::GetTime()) * 3.5f)
-                    : 0.30f;
-                const ImU32 dot = video_streaming
-                    ? IM_COL32(80, 220, 130,
-                               static_cast<int>(t * 255.0f))
-                    : IM_COL32(170, 170, 170, 180);
-                dl->AddCircleFilled(ImVec2(p.x + 6, p.y + 9), 4.5f, dot);
-                ImGui::Dummy(ImVec2(16, 18));
-                ImGui::SameLine();
-                // Prefer the human name if iOS sent one in the
-                // session-setup plist; fall back to peer IP otherwise.
-                const char* primary =
-                    !active_dev.name.empty() ? active_dev.name.c_str()
-                  : !active_dev.peer_ip.empty() ? active_dev.peer_ip.c_str()
-                  : "Device";
-                ImGui::TextUnformatted(primary);
-                ImGui::TextDisabled("  %s", active_dev.kind.c_str());
-                if (!active_dev.name.empty() && !active_dev.peer_ip.empty()) {
-                    // Show the IP underneath when we have a name — the
-                    // name and the IP together pinpoint the device on
-                    // the network.
-                    ImGui::TextDisabled("  %s", active_dev.peer_ip.c_str());
+        ImGui::SetNextWindowPos(ImVec2(0,toolbar_h));
+        ImGui::SetNextWindowSize(ImVec2(side_bar_w,fh-toolbar_h));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(14,29));
+        ImGui::Begin("##navigation",nullptr,kPanelFlags|ImGuiWindowFlags_NoScrollbar);
+        auto* rail=ImGui::GetWindowDrawList();
+        rail->AddLine(ImVec2(side_bar_w-1,toolbar_h),ImVec2(side_bar_w-1,fh),line);
+        ImGui::PushFont(small_font); ImGui::SetCursorPosX(26); ImGui::TextDisabled("YOUR SPACE"); ImGui::PopFont();
+        ImGui::Dummy(ImVec2(0,5));
+        if (ui_draw::nav("##home","Home",ui_draw::Icon::Home,ui.page==0,162,ui.page==0?bold_font:io.FontDefault)) ui.page=0;
+        if (ui_draw::nav("##music","Music",ui_draw::Icon::Music,ui.page==1,162,ui.page==1?bold_font:io.FontDefault)) ui.page=1;
+        if (ui_draw::nav("##mirror","Screen mirroring",ui_draw::Icon::Screen,ui.page==2,162,ui.page==2?bold_font:io.FontDefault)) ui.page=2;
+        ImGui::SetCursorPosY(fh-toolbar_h-150);
+        if (ui_draw::nav("##settings","Settings",ui_draw::Icon::Settings,ui.settings_open,162,io.FontDefault)) ui.settings_open=!ui.settings_open;
+        ImGui::Separator(); ImGui::Dummy(ImVec2(0,3));
+        ImGui::PushFont(small_font);
+        ImVec2 p=ImGui::GetCursorScreenPos(); rail->AddCircleFilled(ImVec2(p.x+11,p.y+8),3.5f,IM_COL32(44,161,116,255));
+        ImGui::SetCursorPosX(36); ImGui::TextDisabled(has_active_dev ? "Device connected" : "Receiver available");
+        ImGui::SetCursorPosX(25); ImGui::PushTextWrapPos(side_bar_w-15); ImGui::TextUnformatted(receiver); ImGui::PopTextWrapPos();
+        ImGui::PopFont(); ImGui::End(); ImGui::PopStyleVar();
+
+        const bool music_view=ui.page==1 && has_active_dev && active_dev.kind=="Audio";
+        const bool video_view=ui.page==2 && show_video;
+        ImGui::SetNextWindowPos(ImVec2(static_cast<float>(stage_x),toolbar_h));
+        ImGui::SetNextWindowSize(ImVec2(static_cast<float>(stage_w)-14,static_cast<float>(stage_h)));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(42,0));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg,ImVec4(245/255.f,246/255.f,244/255.f,1));
+        ImGui::Begin("##content",nullptr,kPanelFlags|(video_view ? ImGuiWindowFlags_NoBackground : 0));
+        auto* draw=ImGui::GetWindowDrawList();
+        ImVec2 origin=ImGui::GetWindowPos();
+        origin.y-=ImGui::GetScrollY();
+        const float width=stage_w-84.f;
+        auto text_at=[&](ImFont* font,float x,float y,ImU32 color,const char* text) { draw->AddText(font,font->FontSize,ImVec2(origin.x+x,origin.y+y),color,text); };
+        auto center_text=[&](ImFont* font,float y,ImU32 color,const char* text) {
+            const float tw=font->CalcTextSizeA(font->FontSize,10000,0,text).x;
+            text_at(font,(stage_w-tw)/2,y,color,text);
+        };
+        auto decoding_note = [&](float bottom) {
+            const bool gpu=live_settings_ && live_settings_->mirror_hwaccel.load();
+            const char* note=gpu ? "GPU acceleration enabled.\nPerformance issues? Try CPU decoding in Settings."
+                                 : "CPU decoding selected.\nGPU acceleration is available in Settings.";
+            const float wrap=std::max(180.f,width-(video_view?506.f:0.f));
+            const ImVec2 size=small_font->CalcTextSizeA(14,10000,wrap,note);
+            draw->AddText(small_font,14,ImVec2(origin.x+stage_w-42-size.x,origin.y+bottom-size.y),
+                          IM_COL32(145,154,147,255),note,nullptr,wrap);
+        };
+        if (music_view || video_view) {
+            draw->AddRectFilled(ImVec2(origin.x+42,origin.y+30),ImVec2(origin.x+81,origin.y+69),IM_COL32(255,255,255,255),9);
+            draw->AddRect(ImVec2(origin.x+42,origin.y+30),ImVec2(origin.x+81,origin.y+69),line,9);
+            ui_draw::icon(draw,ui_draw::Icon::Phone,ImVec2(origin.x+51,origin.y+39),21,muted);
+            text_at(bold_font,93,31,ink,active_dev.name.empty()?"Connected device":active_dev.name.c_str());
+            draw->AddCircleFilled(ImVec2(origin.x+97,origin.y+60),3,IM_COL32(44,161,116,255));
+            text_at(small_font,107,51,muted,music_view ? "Connected · Audio" : "Connected · Screen mirroring");
+            if (firewall_notice) {
+                const float badge_x=stage_w-300.f;
+                draw->AddRectFilled(ImVec2(origin.x+badge_x,origin.y+36),ImVec2(origin.x+badge_x+125,origin.y+66),IM_COL32(255,247,227,255),15);
+                draw->AddRect(ImVec2(origin.x+badge_x,origin.y+36),ImVec2(origin.x+badge_x+125,origin.y+66),IM_COL32(235,216,167,255),15);
+                draw->AddCircleFilled(ImVec2(origin.x+badge_x+14,origin.y+51),3.5f,IM_COL32(183,135,41,255));
+                text_at(small_font,badge_x+26,43,IM_COL32(123,87,30,255),"Check firewall");
+            }
+            ImGui::SetCursorPos(ImVec2(stage_w-150.f,32));
+            if (ui_draw::text_button("Disconnect",ImVec2(108,34)) && disconnect_handler_) disconnect_handler_();
+        } else {
+            text_at(page_font,42,36,ink,ui.page==0 ? "Welcome home." : ui.page==1 ? "Your music on this PC." : "Your screen, live.");
+            const float badge_x=stage_w-167.f;
+            const bool firewall_attention=firewall_notice && !has_active_dev;
+            draw->AddRectFilled(ImVec2(origin.x+badge_x,origin.y+36),ImVec2(origin.x+stage_w-42,origin.y+66),firewall_attention ? IM_COL32(255,247,227,255) : IM_COL32(233,243,236,255),15);
+            draw->AddRect(ImVec2(origin.x+badge_x,origin.y+36),ImVec2(origin.x+stage_w-42,origin.y+66),firewall_attention ? IM_COL32(235,216,167,255) : IM_COL32(217,234,221,255),15);
+            draw->AddCircleFilled(ImVec2(origin.x+badge_x+14,origin.y+51),3.5f,firewall_attention ? IM_COL32(183,135,41,255) : IM_COL32(44,161,116,255));
+            text_at(small_font,badge_x+26,43,firewall_attention ? IM_COL32(123,87,30,255) : IM_COL32(55,117,87,255),has_active_dev ? "Connected" : firewall_attention ? "Check firewall" : "Ready to receive");
+        }
+            if (firewall_notice) {
+                const bool can_allow=firewall.state==ap::platform::FirewallState::NeedsRule;
+                const float banner_y=86, banner_h=firewall.message.empty()?106.f:132.f;
+                const ImVec2 a(origin.x+42,origin.y+banner_y), b(origin.x+stage_w-42,origin.y+banner_y+banner_h);
+                draw->AddRectFilled(a,b,IM_COL32(255,247,227,255),10);
+                draw->AddRect(a,b,IM_COL32(235,216,167,255),10);
+                const char* banner_title=can_allow ? "Allow AirPlay through Windows Firewall" :
+                    firewall.state==ap::platform::FirewallState::Managed ? "Windows Firewall blocks incoming connections" : "Firewall check unavailable";
+                text_at(bold_font,58,banner_y+14,IM_COL32(123,87,30,255),banner_title);
+                const char* detail=can_allow ? "Allow this app to receive connections from devices on your local network." : firewall.message.c_str();
+                draw->AddText(small_font,16,ImVec2(a.x+16,a.y+44),IM_COL32(131,105,62,255),detail,nullptr,width-210);
+                if (can_allow && !firewall.message.empty())
+                    draw->AddText(small_font,16,ImVec2(a.x+16,a.y+82),IM_COL32(131,105,62,255),firewall.message.c_str(),nullptr,width-210);
+                ImGui::SetCursorPos(ImVec2(stage_w-222.f,banner_y+41));
+                ImGui::BeginDisabled(firewall.busy);
+                if (can_allow && ui_draw::text_button(firewall.busy ? "Waiting for Windows..." : "Allow on local network",ImVec2(164,34)))
+                    firewall_monitor.allow_local_network();
+                ImGui::EndDisabled();
+            }
+
+        if (music_view) {
+            const bool wide=stage_w>=780;
+            const float cover_size=wide?std::min(330.f,width*.45f):230.f;
+            const float cover_x=wide?42.f:(stage_w-cover_size)/2;
+            const float cover_y=(wide?std::max(120.f,(stage_h-cover_size)*.45f):100.f)+firewall_offset;
+            const ImVec2 tl(origin.x+cover_x,origin.y+cover_y),br(tl.x+cover_size,tl.y+cover_size);
+            draw->AddRectFilled(ImVec2(tl.x,tl.y+9),ImVec2(br.x,br.y+9),IM_COL32(48,63,51,12),12);
+            if (cover_tex) draw->AddImageRounded((ImTextureID)(intptr_t)cover_tex,tl,br,ImVec2(0,0),ImVec2(1,1),IM_COL32_WHITE,12);
+            else {
+                draw->AddRectFilled(tl,br,IM_COL32(231,235,229,255),12);
+                ui_draw::icon(draw,ui_draw::Icon::Music,ImVec2(tl.x+cover_size/2-25,tl.y+cover_size/2-25),50,IM_COL32(145,158,147,255));
+            }
+            const float tx=wide?cover_x+cover_size+43:42;
+            float ty=wide?cover_y+20:cover_y+cover_size+22;
+            text_at(small_font,tx,ty,muted,playing_now ? "NOW PLAYING" : "PAUSED"); ty+=30;
+            auto track_line=[&](SDL_Texture* texture,int w,int h,float scale,ImU32 tint) {
+                if (!texture || w<=0 || h<=0) return;
+                const float fit=std::min(scale,(stage_w-tx-42)/w);
+                draw->AddImage((ImTextureID)(intptr_t)texture,ImVec2(origin.x+tx,origin.y+ty),ImVec2(origin.x+tx+w*fit,origin.y+ty+h*fit),ImVec2(0,0),ImVec2(1,1),tint);
+                ty+=h*fit+9;
+            };
+            track_line(title_tex,title_w,title_h,1,ink);
+            track_line(artist_tex,artist_w,artist_h,.8f,IM_COL32(134,146,137,255));
+            track_line(album_tex,album_w,album_h,.65f,IM_COL32(205,215,202,255));
+            ImGui::SetCursorPos(ImVec2(tx,ty+23));
+            ImGui::BeginChild("##music_transport",ImVec2(stage_w-tx-42,165),false);
+            if (audio_control_handler_) draw_audio_controls();
+            ImGui::EndChild();
+            if (wide) {
+                const float footer_y=std::max(stage_h-78.f,std::max(cover_y+cover_size,ty+188)+35);
+                draw->AddLine(ImVec2(origin.x+42,origin.y+footer_y),ImVec2(origin.x+stage_w-42,origin.y+footer_y),line);
+                ui_draw::icon(draw,ui_draw::Icon::Cast,ImVec2(origin.x+42,origin.y+footer_y+19),16,IM_COL32(114,145,123,255));
+                text_at(small_font,67,footer_y+19,muted,"Playing from your device on this PC");
+                ImGui::SetCursorPosY(footer_y+45); ImGui::Dummy(ImVec2(1,1));
+            }
+        } else if (video_view) {
+            ImGui::SetCursorPos(ImVec2(42,stage_h-47.f));
+            const bool recording=recorder_ && recorder_->status().recording;
+            if (ui_draw::text_button(recording ? "Stop recording" : "Record",ImVec2(125,34))) toggle_recording();
+            ImGui::SameLine(); if (ui_draw::text_button("Fullscreen",ImVec2(110,34))) toggle_fullscreen();
+            ImGui::SameLine(); if (ui_draw::text_button("Hide interface",ImVec2(120,34))) ui.chromeless=true;
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!live_settings_);
+            if (ui_draw::text_button("Rotation",ImVec2(98,34))) ImGui::OpenPopup("##quick_rotation");
+            const ImVec2 rotation_button=ImGui::GetItemRectMin();
+            draw->AddTriangleFilled(ImVec2(rotation_button.x+82,rotation_button.y+15),
+                                    ImVec2(rotation_button.x+90,rotation_button.y+15),
+                                    ImVec2(rotation_button.x+86,rotation_button.y+20),muted);
+            ImGui::EndDisabled();
+            ImGui::SetNextWindowPos(ImVec2(rotation_button.x,rotation_button.y-6),ImGuiCond_Appearing,ImVec2(0,1));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(12,10));
+            if (ImGui::BeginPopup("##quick_rotation")) {
+                const int selected=live_settings_->video_rotation.load()+1;
+                for (int i=0;i<IM_ARRAYSIZE(kRotationModes);++i) {
+                    if (ImGui::MenuItem(kRotationModes[i],nullptr,selected==i))
+                        live_settings_->video_rotation.store(i-1);
                 }
-                if (!active_dev.model.empty()) {
-                    ImGui::TextDisabled("  %s", active_dev.model.c_str());
-                }
-                if (!active_dev.session_id.empty()) {
-                    // Truncate the AirPlay session id to a short
-                    // identifier — the full string is just noise.
-                    const std::string short_id =
-                        active_dev.session_id.size() > 8
-                          ? active_dev.session_id.substr(0, 8) + "…"
-                          : active_dev.session_id;
-                    ImGui::TextDisabled("  sid %s", short_id.c_str());
-                }
-            } else {
-                ImGui::TextDisabled("No device connected");
+                ImGui::EndPopup();
+            }
+            ImGui::PopStyleVar();
+            decoding_note(stage_h-12.f);
+        } else {
+            const float cx=stage_w*.5f;
+            const float hero_y=(stage_h < 720 ? 90.f : std::max(105.f,(stage_h-690.f)*.3f+120.f))+firewall_offset;
+            const ImVec2 tile(origin.x+cx-38,origin.y+hero_y);
+            draw->AddRectFilled(tile,ImVec2(tile.x+76,tile.y+76),IM_COL32(233,239,253,255),22);
+            draw->AddRect(tile,ImVec2(tile.x+76,tile.y+76),IM_COL32(219,229,252,255),22);
+            ui_draw::icon(draw,ui_draw::Icon::Cast,ImVec2(tile.x+19,tile.y+19),38,ui_draw::blue);
+            center_text(heading_font,hero_y+99,ink,"Your device.");
+            center_text(heading_font,hero_y+143,ink,"A little bigger.");
+            center_text(io.FontDefault,hero_y+194,muted,"Your music and your screen, right here on this PC.");
+            center_text(io.FontDefault,hero_y+219,muted,"From your iPhone or iPad.");
+            const float card_w=std::min(440.f,width),card_x=(stage_w-card_w)/2,card_y=hero_y+(stage_h<720?248:268);
+            const ImVec2 cp(origin.x+card_x,origin.y+card_y);
+            draw->AddRectFilled(cp,ImVec2(cp.x+card_w,cp.y+78),IM_COL32_WHITE,12);
+            draw->AddRect(cp,ImVec2(cp.x+card_w,cp.y+78),line,12);
+            text_at(small_font,card_x+20,card_y+15,muted,"SELECT ON YOUR DEVICE");
+            draw->PushClipRect(cp,ImVec2(cp.x+card_w-56,cp.y+78),true);
+            text_at(receiver_font,card_x+20,card_y+38,ink,receiver);
+            draw->PopClipRect();
+            ImGui::SetCursorPos(ImVec2(card_x+card_w-54,card_y+21));
+            if (ui_draw::icon_button("##rename",ui_draw::Icon::Settings,"Receiver settings")) ui.settings_open=true;
+            const float steps_y=card_y+(stage_h<720?105:121);
+            draw->AddLine(ImVec2(origin.x+42,origin.y+steps_y),ImVec2(origin.x+stage_w-42,origin.y+steps_y),line);
+            const char* titles[]={"Same Wi-Fi network","Choose your mode","Select your PC"};
+            const char* descriptions[]={"Connect your device and this PC to the same network.","Use AirPlay for music, or Screen Mirroring from Control Center.","Choose this receiver. The connection starts automatically."};
+            for (int i=0;i<3;++i) {
+                const float x=42+i*(width+22)/3;
+                const ImVec2 circle(origin.x+x+12,origin.y+steps_y+40);
+                draw->AddCircleFilled(circle,12,IM_COL32_WHITE,24); draw->AddCircle(circle,12,line,24);
+                char n[2]={static_cast<char>('1'+i),0};
+                text_at(small_font,x+9,steps_y+32,muted,n);
+                text_at(bold_font,x,steps_y+67,ink,titles[i]);
+                draw->AddText(small_font,16,ImVec2(origin.x+x,origin.y+steps_y+93),muted,descriptions[i],nullptr,(width-44)/3);
+            }
+            const char* help="My PC isn't showing up";
+            const float help_w=small_font->CalcTextSizeA(16,10000,0,help).x;
+            ImGui::SetCursorPos(ImVec2((stage_w-help_w)/2,steps_y+157));
+            if (ui_draw::surface("##connection_help",ImVec2(help_w,22))) ImGui::OpenPopup("Connection help");
+            const ImVec2 hp=ImGui::GetItemRectMin();
+            draw->AddText(small_font,16,hp,muted,help); draw->AddLine(ImVec2(hp.x,hp.y+17),ImVec2(hp.x+help_w,hp.y+17),muted);
+            const float help_card_width=std::min(440.f,stage_w-64.f);
+            ImGui::SetNextWindowSize(ImVec2(help_card_width,0));
+            ImGui::SetNextWindowPos(ImVec2(origin.x+stage_w*.5f,std::min(hp.y-10,fh-20)),ImGuiCond_Appearing,ImVec2(.5f,1));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(24,22));
+            ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding,12);
+            ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize,1);
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,ImVec2(10,8));
+            ImGui::PushStyleColor(ImGuiCol_PopupBg,ImVec4(1,1,1,1));
+            ImGui::PushStyleColor(ImGuiCol_Border,ImVec4(230/255.f,232/255.f,231/255.f,1));
+            if (ImGui::BeginPopup("Connection help",ImGuiWindowFlags_NoMove)) {
+                ImGui::PushFont(page_font);
+                ImGui::TextUnformatted("Can't find your PC?");
+                ImGui::PopFont();
+                ImGui::SameLine(help_card_width-59);
+                if (ui_draw::icon_button("##close_help",ui_draw::Icon::Close,"Close help")) ImGui::CloseCurrentPopup();
                 ImGui::Spacing();
-                ImGui::TextDisabled(
-                    "Open AirPlay on your device and pick this "
-                    "receiver to start mirroring.");
+                ImGui::PushTextWrapPos(help_card_width-24);
+                auto help_step=[&](const char* title,const char* description) {
+                    ImGui::PushFont(bold_font); ImGui::TextUnformatted(title); ImGui::PopFont();
+                    ImGui::PushFont(small_font); ImGui::TextDisabled("%s",description); ImGui::PopFont();
+                    ImGui::Dummy(ImVec2(0,8));
+                };
+                help_step("1. Use the same network", "Connect your iPhone or iPad and this PC to the same Wi-Fi network.");
+                help_step("2. Check your VPN", "A VPN can hide local devices. Check that it allows access to your local network.");
+                help_step("3. Check Windows Firewall", "If a firewall warning is shown, choose Allow on local network.");
+                ImGui::Separator();
+                ImGui::PushFont(small_font); ImGui::TextDisabled("Then reopen AirPlay on your device."); ImGui::PopFont();
+                ImGui::PopTextWrapPos();
+                ImGui::EndPopup();
             }
-            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor(2);
+            ImGui::PopStyleVar(4);
+            const float footer_y=std::max(steps_y+(stage_h<720?185:203),stage_h-34.f);
+            text_at(small_font,42,footer_y,IM_COL32(145,154,147,255),"Windows · Local network");
+            if (ui.page==2) decoding_note(footer_y+16);
+            ImGui::SetCursorPosY(footer_y+16); ImGui::Dummy(ImVec2(1,1));
         }
-        ImGui::End();
+        ImGui::End(); ImGui::PopStyleColor(); ImGui::PopStyleVar();
 
-        // ---- Right options panel ----------------------------------
-        // Always shown when chrome is on (chromeless / fullscreen
-        // already collapse the surrounding `if (!fullscreen ...)`
-        // block, so reaching here means the user wants chrome).
-        {
+        // Settings are a drawer above the current view, not a permanent sidebar.
+        if (ui.settings_open) {
+            ImGui::SetNextWindowPos(ImVec2(0,toolbar_h));
+            ImGui::SetNextWindowSize(ImVec2(fw-opts_bar_w,fh-toolbar_h));
+            ImGui::PushStyleColor(ImGuiCol_WindowBg,ImVec4(.11f,.17f,.20f,.18f));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
+            ImGui::Begin("##settings_shade",nullptr,kPanelFlags|ImGuiWindowFlags_NoScrollbar);
+            if (ui_draw::surface("##dismiss_settings",ImGui::GetContentRegionAvail())) ui.settings_open=false;
+            ImGui::End(); ImGui::PopStyleVar(); ImGui::PopStyleColor();
             ImGui::SetNextWindowPos(ImVec2(fw - opts_bar_w, toolbar_h));
             ImGui::SetNextWindowSize(ImVec2(opts_bar_w, fh - toolbar_h - status_bar_h));
-            if (ImGui::Begin("##options_panel", nullptr, kPanelFlags)) {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
+            ImGui::Begin("##settings_drawer",nullptr,kPanelFlags|ImGuiWindowFlags_NoScrollbar);
+            // Keep the entire scrollbar inside the client area, clear of
+            // the six-pixel native resize handles on the outer edge.
+            ImGui::SetCursorPos(ImVec2(0,8));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(27,27));
+            ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize,14);
+            if (ImGui::BeginChild("##options_panel",ImVec2(opts_bar_w-14,fh-toolbar_h-status_bar_h-16),false,
+                                  kPanelFlags|ImGuiWindowFlags_AlwaysUseWindowPadding)) {
                 ImGui::PushStyleColor(ImGuiCol_Text,
-                                      ImVec4(0.65f, 0.68f, 0.72f, 1.0f));
-                ImGui::TextUnformatted("OPTIONS");
+                                      ImVec4(.125f,.149f,.161f,1));
+                ImGui::PushFont(page_font);
+                ImGui::TextUnformatted("Settings");
+                ImGui::PopFont();
+                ImGui::SameLine(opts_bar_w-65);
+                if (ui_draw::icon_button("##close_settings",ui_draw::Icon::Close,"Close settings")) ui.settings_open = false;
                 ImGui::PopStyleColor();
                 ImGui::Separator();
                 // Wrap descriptive text to the panel width so long
                 // hint strings (VSYNC / GPU decoder explanations, etc.)
                 // stay inside the panel instead of running off-screen.
                 ImGui::PushTextWrapPos(0.0f);
-                if (live_settings_ && ImGui::CollapsingHeader("Receiver Name",
+                auto settings_section = [&](const char* label, ImGuiTreeNodeFlags flags = 0) {
+                    ImGui::PushFont(bold_font);
+                    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize,0);
+                    const bool open = ImGui::CollapsingHeader(label,flags);
+                    ImGui::PopStyleVar(); ImGui::PopFont();
+                    return open;
+                };
+                if (live_settings_ && settings_section("Receiver name",
                         ImGuiTreeNodeFlags_DefaultOpen)) {
                     ImGui::SetNextItemWidth(-1.0f);
                     const bool enter = ImGui::InputText("##receiver_name",
@@ -1684,7 +1986,10 @@ void VideoRenderer::run(const std::string& title) {
                     const auto name = ap::airplay::normalize_receiver_name(receiver_name_buf.data());
                     const bool changed = name != live_settings_->receiver_name();
                     ImGui::BeginDisabled(name.empty() || !changed);
+                    ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(.14f,.40f,.92f,1));
+                    ImGui::PushStyleColor(ImGuiCol_Text,ImVec4(1,1,1,1));
                     const bool apply = ImGui::Button("Apply name");
+                    ImGui::PopStyleColor(2);
                     ImGui::EndDisabled();
                     if ((apply || enter) && !name.empty() && changed) {
                         live_settings_->set_receiver_name(name);
@@ -1695,30 +2000,7 @@ void VideoRenderer::run(const std::string& title) {
                     else
                         ImGui::TextDisabled("Shown in AirPlay on your devices. Saved automatically.");
                 }
-                if (ImGui::CollapsingHeader("Rotation",
-                        ImGuiTreeNodeFlags_DefaultOpen)) {
-                    if (live_settings_) {
-                        const char* modes[] = {
-                            "Automatic (device)", "Manual: 0 degrees",
-                            "Manual: 90 degrees", "Manual: 180 degrees",
-                            "Manual: 270 degrees"
-                        };
-                        int selected = live_settings_->video_rotation.load() + 1;
-                        ImGui::SetNextItemWidth(-1.0f);
-                        if (ImGui::Combo("##video_rotation", &selected, modes, 5))
-                            live_settings_->video_rotation.store(selected - 1);
-                        ImGui::TextDisabled(
-                            "Auto follows the orientation sent by the device."
-                            " Manual angles rotate clockwise from the received image.");
-                        if (video_tex_w > 0 && video_tex_h > 0)
-                            ImGui::TextDisabled("Received: %s (%d x %d)",
-                                video_tex_w > video_tex_h ? "Landscape" :
-                                video_tex_w < video_tex_h ? "Portrait" : "Square",
-                                video_tex_w, video_tex_h);
-                        ImGui::TextDisabled("Applies live to display only; recording is unchanged.");
-                    }
-                }
-                if (ImGui::CollapsingHeader("Mirror Resolution",
+                if (settings_section("Mirror resolution",
                         ImGuiTreeNodeFlags_DefaultOpen)) {
                     if (live_settings_) {
                         struct Preset { const char* label; int w; int h; };
@@ -1746,12 +2028,11 @@ void VideoRenderer::run(const std::string& title) {
                         // Reset to false whenever a preset is chosen
                         // explicitly, or auto-set when current values
                         // don't match any preset (eg --mirror-res CLI).
-                        static bool custom_mode = false;
-                        if (sel < 0) custom_mode = true;
+                        if (sel < 0) custom_resolution = true;
 
                         char preview_buf[48];
                         const char* preview;
-                        if (custom_mode) {
+                        if (custom_resolution) {
                             std::snprintf(preview_buf, sizeof(preview_buf),
                                           "Custom: %dx%d", cur_w, cur_h);
                             preview = preview_buf;
@@ -1759,26 +2040,27 @@ void VideoRenderer::run(const std::string& title) {
                             preview = presets[sel].label;
                         }
 
+                        ImGui::SetNextItemWidth(-1);
                         if (ImGui::BeginCombo("##mirror_res", preview)) {
                             for (int i = 0; i < (int)IM_ARRAYSIZE(presets); ++i) {
                                 const bool is_sel =
-                                    (!custom_mode && sel == i);
+                                    (!custom_resolution && sel == i);
                                 if (ImGui::Selectable(presets[i].label,
                                                       is_sel)) {
-                                    custom_mode = false;
+                                    custom_resolution = false;
                                     live_settings_->mirror_width.store(presets[i].w);
                                     live_settings_->mirror_height.store(presets[i].h);
                                 }
                                 if (is_sel) ImGui::SetItemDefaultFocus();
                             }
                             ImGui::Separator();
-                            if (ImGui::Selectable("Custom...", custom_mode)) {
-                                custom_mode = true;
+                            if (ImGui::Selectable("Custom...", custom_resolution)) {
+                                custom_resolution = true;
                             }
                             ImGui::EndCombo();
                         }
 
-                        if (custom_mode) {
+                        if (custom_resolution) {
                             // Width / height inputs that commit live
                             // (no Enter) as soon as the value falls in
                             // the accepted range. While the user is
@@ -1814,9 +2096,7 @@ void VideoRenderer::run(const std::string& title) {
                                 "Range: 320-7680 x 240-4320");
                         }
                         ImGui::TextDisabled(
-                            "Maximum stream dimensions, not device native resolution."
-                            " The device chooses the actual resolution and aspect ratio."
-                            " Square limits allow room for portrait and landscape.");
+                            "Maximum video size. Your device chooses the actual stream resolution.");
                         if (video_tex_w > 0 && video_tex_h > 0)
                             ImGui::TextDisabled("Received: %d x %d", video_tex_w, video_tex_h);
                         ImGui::TextDisabled("Applies on next device connection");
@@ -1824,63 +2104,24 @@ void VideoRenderer::run(const std::string& title) {
                         ImGui::TextDisabled("(LiveSettings not wired)");
                     }
                 }
-                if (ImGui::CollapsingHeader("Frame rate")) {
-                    if (live_settings_) {
-                        // iOS effectively takes the min of maxFPS and
-                        // refreshRate, so two separate sliders meant
-                        // the same thing twice. Drive both atomics
-                        // from a single "Frame rate cap" knob and
-                        // keep the underlying fields in lockstep.
-                        int cap = live_settings_->max_fps.load();
-                        ImGui::SetNextItemWidth(200);
-                        if (ImGui::SliderInt("Frame rate cap",
-                                             &cap, 1, 60, "%d fps")) {
-                            live_settings_->max_fps.store(cap);
-                            live_settings_->refresh_rate.store(cap);
-                        }
-                        ImGui::TextDisabled(
-                            "iOS caps mirror at 60 fps regardless of hint;"
-                            " lower values force a deterministic cadence.");
-                        ImGui::TextDisabled("Applies on next device connection");
-                    } else {
-                        ImGui::TextDisabled("(LiveSettings not wired)");
-                    }
-                }
-                if (ImGui::CollapsingHeader("Compression",
-                        ImGuiTreeNodeFlags_DefaultOpen)) {
-                    if (live_settings_) {
-                        bool hevc = live_settings_->hevc_enabled.load();
-                        if (ImGui::Checkbox("Allow HEVC (H.265)", &hevc)) {
-                            live_settings_->hevc_enabled.store(hevc);
-                        }
-                        ImGui::TextDisabled(
-                            hevc
-                              ? "The device may pick HEVC at high resolution"
-                              : "Force H.264 (more CPU, more bandwidth)");
-                        ImGui::TextDisabled("Applies on next device connection");
-                    } else {
-                        ImGui::TextDisabled("(LiveSettings not wired)");
-                    }
-                }
-                if (ImGui::CollapsingHeader("Mirror Decoder",
+                if (settings_section("Video decoder",
                         ImGuiTreeNodeFlags_DefaultOpen)) {
                     if (live_settings_) {
                         bool hw = live_settings_->mirror_hwaccel.load();
-                        if (ImGui::Checkbox("GPU decode (D3D11, no CPU readback)",
+                        if (ImGui::Checkbox("Use GPU acceleration",
                                             &hw)) {
                             live_settings_->mirror_hwaccel.store(hw);
                         }
                         ImGui::TextDisabled(
                             hw
-                              ? "D3D11 decode and color conversion stay on the GPU."
-                                " Software fallback if unavailable."
-                              : "Software libavcodec decode; GPU display.");
+                              ? "Uses your graphics card when available."
+                              : "Uses your processor to decode video.");
                         ImGui::TextDisabled("Applies on next device connection");
 
                         ImGui::Separator();
 
                         bool vsync = live_settings_->vsync_enabled.load();
-                        if (ImGui::Checkbox("VSYNC", &vsync)) {
+                        if (ImGui::Checkbox("Synchronize with display", &vsync)) {
                             live_settings_->vsync_enabled.store(vsync);
                         }
                         ImGui::TextDisabled(
@@ -1893,13 +2134,7 @@ void VideoRenderer::run(const std::string& title) {
                         ImGui::TextDisabled("(LiveSettings not wired)");
                     }
                 }
-                if (ImGui::CollapsingHeader("Network",
-                        ImGuiTreeNodeFlags_DefaultOpen)) {
-                    ImGui::TextDisabled("RTSP   :7000");
-                    ImGui::TextDisabled("HLS    :7100");
-                    ImGui::TextDisabled("mDNS   advertising");
-                }
-                if (ImGui::CollapsingHeader("Recording")) {
+                if (settings_section("Recording")) {
                     const auto rec = recorder_->status();
                     ImGui::TextUnformatted("Folder");
 #if defined(_WIN32)
@@ -1975,17 +2210,92 @@ void VideoRenderer::run(const std::string& title) {
                         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
                                            "%s", rec.error.c_str());
                 }
-                if (ImGui::CollapsingHeader("Hotkeys")) {
+                ImGui::Separator();
+                if (settings_section("Advanced")) {
+                    ImGui::Checkbox("Show diagnostics", &ui.diagnostics);
+                if (settings_section("Rotation")) {
+                    if (live_settings_) {
+                        int selected = live_settings_->video_rotation.load() + 1;
+                        ImGui::SetNextItemWidth(-1.0f);
+                        if (ImGui::Combo("##video_rotation", &selected, kRotationModes, IM_ARRAYSIZE(kRotationModes)))
+                            live_settings_->video_rotation.store(selected - 1);
+                        ImGui::TextDisabled(
+                            "Auto follows the orientation sent by the device."
+                            " Manual angles rotate clockwise from the received image.");
+                        if (video_tex_w > 0 && video_tex_h > 0)
+                            ImGui::TextDisabled("Received: %s (%d x %d)",
+                                video_tex_w > video_tex_h ? "Landscape" :
+                                video_tex_w < video_tex_h ? "Portrait" : "Square",
+                                video_tex_w, video_tex_h);
+                        ImGui::TextDisabled("Applies live to display only; recording is unchanged.");
+                    }
+                }
+                if (settings_section("Frame rate")) {
+                    if (live_settings_) {
+                        // iOS effectively takes the min of maxFPS and
+                        // refreshRate, so two separate sliders meant
+                        // the same thing twice. Drive both atomics
+                        // from a single "Frame rate cap" knob and
+                        // keep the underlying fields in lockstep.
+                        int cap = live_settings_->max_fps.load();
+                        ImGui::SetNextItemWidth(200);
+                        if (ImGui::SliderInt("Frame rate cap",
+                                             &cap, 1, 60, "%d fps")) {
+                            live_settings_->max_fps.store(cap);
+                            live_settings_->refresh_rate.store(cap);
+                        }
+                        ImGui::TextDisabled(
+                            "iOS caps mirror at 60 fps regardless of hint;"
+                            " lower values force a deterministic cadence.");
+                        ImGui::TextDisabled("Applies on next device connection");
+                    } else {
+                        ImGui::TextDisabled("(LiveSettings not wired)");
+                    }
+                }
+                if (settings_section("Compression")) {
+                    if (live_settings_) {
+                        bool hevc = live_settings_->hevc_enabled.load();
+                        if (ImGui::Checkbox("Allow HEVC (H.265)", &hevc)) {
+                            live_settings_->hevc_enabled.store(hevc);
+                        }
+                        ImGui::TextDisabled(
+                            hevc
+                              ? "The device may pick HEVC at high resolution"
+                              : "Force H.264 (more CPU, more bandwidth)");
+                        ImGui::TextDisabled("Applies on next device connection");
+                    } else {
+                        ImGui::TextDisabled("(LiveSettings not wired)");
+                    }
+                }
+                if (settings_section("Network")) {
+                    ImGui::TextDisabled("RTSP   :7000");
+                    ImGui::TextDisabled("HLS    :7100");
+                    ImGui::TextDisabled("mDNS   advertising");
+                }
+                if (settings_section("Keyboard shortcuts")) {
                     ImGui::BulletText("F / F11 / double-click  Toggle fullscreen");
                     ImGui::BulletText("H       Hide / show the interface");
                     ImGui::BulletText("R       Start / stop recording");
                     ImGui::BulletText("Esc     Exit fullscreen / show UI / quit");
                 }
+                }
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::TextDisabled("Restore all app preferences to their defaults.");
+                ImGui::BeginDisabled(!live_settings_);
+                if (ui_draw::text_button("Reset all settings",ImVec2(-1,36))) reset_all_settings();
+                ImGui::EndDisabled();
+                if (ImGui::GetTime() < settings_reset_notice_until)
+                    ImGui::TextDisabled("Default settings restored.");
                 ImGui::PopTextWrapPos();
             }
+            ImGui::EndChild();
+            ImGui::PopStyleVar(2);
             ImGui::End();
+            ImGui::PopStyleVar();
         }
 
+        if (ui.diagnostics) {
         // ---- Bottom status bar ------------------------------------
         ImGui::SetNextWindowPos(ImVec2(0.0f, fh - status_bar_h));
         ImGui::SetNextWindowSize(ImVec2(fw, status_bar_h));
@@ -2070,57 +2380,26 @@ void VideoRenderer::run(const std::string& title) {
         }
         ImGui::End();
         ImGui::PopStyleVar();
+        } // diagnostics
         } // !fullscreen
 
         // Audio controls stay on the render thread; network work is queued
         // to main(). Only received sender state drives play/time indicators.
-        if (has_active_dev && active_dev.kind == "Audio" && audio_control_handler_ && stage_w > 120 && stage_h > 100) {
-            constexpr float controls_h = 112.0f;
-            ImGui::SetNextWindowPos(ImVec2(static_cast<float>(stage_x),
-                static_cast<float>(stage_y + stage_h) - controls_h));
-            ImGui::SetNextWindowSize(ImVec2(static_cast<float>(stage_w), controls_h));
+        if (has_active_dev && active_dev.kind == "Audio" && no_chrome && audio_control_handler_ && stage_w > 120 && stage_h > 100) {
+            constexpr float controls_h = 150.0f;
+            const bool wide = !no_chrome && stage_w >= 780;
+            const float controls_x = wide ? 400.0f : 20.0f;
+            const float controls_y = wide ? std::max(90.0f, (stage_h - std::min(300.0f, stage_h * .40f)) * .42f) + 180 : stage_h - controls_h;
+            ImGui::SetNextWindowPos(ImVec2(stage_x + controls_x, stage_y + controls_y));
+            ImGui::SetNextWindowSize(ImVec2(stage_w - controls_x - 20, controls_h));
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(.961f,.965f,.957f,1));
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20, 8));
             if (ImGui::Begin("##audio_controls", nullptr, kPanelFlags | ImGuiWindowFlags_NoScrollbar)) {
-                const bool ready = audio_control_available_.load();
-                const bool pending = audio_command_pending_.load();
-                auto command = [&](ap::airplay::MediaCommand action, uint32_t position = 0) {
-                    audio_command_failed_.store(false);
-                    audio_command_pending_.store(true);
-                    audio_control_handler_(action, position);
-                };
-                ImGui::BeginDisabled(!ready || pending);
-                if (ImGui::Button("Previous")) command(ap::airplay::MediaCommand::Previous);
-                ImGui::SameLine();
-                if (ImGui::Button(playing_now ? "Pause" : "Play", ImVec2(68, 0)))
-                    command(ap::airplay::MediaCommand::PlayPause);
-                ImGui::SameLine();
-                if (ImGui::Button("Next")) command(ap::airplay::MediaCommand::Next);
-                ImGui::EndDisabled();
-                ImGui::SameLine();
-                if (pending) ImGui::TextDisabled("Sending...");
-                else if (!ready) ImGui::TextDisabled("Remote control unavailable");
-                else if (audio_command_failed_.load()) ImGui::TextDisabled("Command failed or unsupported");
-
-                const uint32_t total = progress_total_ms_.load();
-                uint64_t elapsed = progress_elapsed_ms_.load();
-                const int64_t pushed = progress_pushed_at_ns_.load();
-                if (playing_now && pushed > 0) {
-                    const auto clock_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count();
-                    if (clock_ns > pushed) elapsed += (clock_ns - pushed) / 1000000;
-                }
-                elapsed = total > 0 ? std::min<uint64_t>(elapsed, total) : 0;
-                // The tested iOS sender rejects absolute DACP seek (HTTP 400).
-                // Keep truthful progress rather than an actionable slider that fails.
-                const float progress = total > 0 ? static_cast<float>(elapsed) / total : 0.0f;
-                ImGui::ProgressBar(progress, ImVec2(-1, 8), "");
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Playback position (read-only)");
-                const uint32_t display = static_cast<uint32_t>(elapsed);
-                ImGui::Text("%u:%02u / %u:%02u", display / 60000, (display / 1000) % 60,
-                    total / 60000, (total / 1000) % 60);
+                draw_audio_controls();
             }
             ImGui::End();
             ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
         }
 
         // Pulsing "Waiting for AirPlay" ring centered in the stage when
@@ -2130,7 +2409,7 @@ void VideoRenderer::run(const std::string& title) {
             const bool video_streaming_idle =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_video_frame_time).count() < 1500;
-            if (!video_streaming_idle && !has_active_dev &&
+            if (no_chrome && !video_streaming_idle && !has_active_dev &&
                 stage_w > 0 && stage_h > 0) {
                 ImDrawList* bg = ImGui::GetBackgroundDrawList();
                 const float cx = static_cast<float>(stage_x) + stage_w * 0.5f;
@@ -2158,6 +2437,7 @@ void VideoRenderer::run(const std::string& title) {
             }
         }
 
+        publish_preferences();
         ImGui::Render();
         ImGui_ImplSDLRenderer2_RenderDrawData(
             ImGui::GetDrawData(), renderer);
@@ -2186,6 +2466,7 @@ void VideoRenderer::run(const std::string& title) {
     }
 
     if (recorder_) recorder_->stop();
+    publish_preferences();
     if (title_tex)     SDL_DestroyTexture(title_tex);
     if (artist_tex)    SDL_DestroyTexture(artist_tex);
     if (album_tex)     SDL_DestroyTexture(album_tex);

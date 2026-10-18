@@ -67,7 +67,7 @@ public:
         uint64_t                   stream_connection_id = 0;
         int                        ct          = 0;
         int                        sample_rate = 44100;
-        bool                       mirror_hwaccel = false;
+        bool                       mirror_hwaccel = true;
     };
 
     bool setup_stream(int type, uint16_t& data_port, uint16_t& control_port,
@@ -85,6 +85,8 @@ public:
     // Thread-safe: forwards to AudioReceiver if a type-96 stream is alive.
     void set_audio_volume_db(float db);
     void flush_audio(std::optional<uint32_t> boundary = {});
+    void resume_audio();
+    void set_audio_track(const std::string& track);
 
     void teardown();
     bool audio_only() const;
@@ -106,6 +108,11 @@ private:
     std::unique_ptr<NtpClient>                    ntp_;
     std::unique_ptr<ap::audio::AudioReceiver>     audio_;      // type 96 UDP
     ap::video::VideoRenderer*                     renderer_{nullptr};
+    // A sender may release type 96 during pause without ending this session.
+    // DACP must remain usable to ask it to recreate the audio stream.
+    bool audio_control_session_ = false;
+    ap::audio::AudioReceiver::PauseState paused_audio_;
+    std::string audio_track_;
 
     std::string session_id_;
 };

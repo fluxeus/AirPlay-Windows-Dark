@@ -160,14 +160,15 @@ int main() {
         ap::audio::AudioReceiver::Config config;
         config.data_sock = data.fd; config.control_sock = control.fd; config.ntp = &ntp;
         config.aes_key.resize(16); config.aes_iv.resize(16); config.ct = 2; config.synchronize = true;
+        config.preserve_paused_audio = false; // exercise ordinary FLUSH semantics separately
         require(receiver.start(config), "Audio receiver start");
         // Receiver owns data socket after start; retain its address for sends.
         data.fd = INVALID_SOCK;
         const auto payload = fixture();
-        auto send_audio = [&](uint16_t seq, uint32_t rtp, int lead_seconds, const Udp* destination = nullptr) {
+        auto send_audio = [&](uint16_t seq, uint32_t rtp, int lead_seconds, const Udp* destination = nullptr, bool send_anchor = true) {
             unsigned char anchor[20]{}; anchor[0] = 0x80; anchor[1] = 0xd4;
             put32(anchor + 4, rtp - lead_seconds * 44100); put64(anchor + 8, remote_now()); put32(anchor + 16, rtp);
-            send_to(sender, control, anchor, 20);
+            if (send_anchor) send_to(sender, control, anchor, 20);
             std::this_thread::sleep_for(10ms);
             std::vector<unsigned char> packet(payload.size() + 12);
             packet[0] = 0x80; packet[1] = 0x60; packet[2] = static_cast<unsigned char>(seq >> 8); packet[3] = static_cast<unsigned char>(seq); put32(packet.data() + 4, rtp);
@@ -201,7 +202,6 @@ int main() {
         receiver.set_synchronized(true); send_audio(5, 42345678, 4);
         const auto stopped = Clock::now(); receiver.stop();
         require(Clock::now() - stopped < 500ms, "Stop interrupts a future scheduled frame");
-        ntp.stop();
         // An unresponsive timing peer must not add two seconds at every FLUSH.
         Udp silent_timing(AF_INET6), silent_peer, fallback_data;
         ap::airplay::NtpClient silent_clock;
@@ -222,6 +222,61 @@ int main() {
         for (int i = 0; i < 30 && played < 5; ++i) std::this_thread::sleep_for(10ms);
         require(played == 5 && Clock::now() - resumed < 400ms, "FLUSH does not repeat the two-second clock acquisition wait");
         fallback.stop(); silent_clock.stop();
+        Udp bridge_data;
+        ap::audio::AudioReceiver bridge;
+        auto bridge_config = config;
+        bridge_config.data_sock = bridge_data.fd;
+        bridge_config.preserve_paused_audio = true;
+        require(bridge.start(bridge_config), "Pause-preserving receiver");
+        bridge_data.fd = INVALID_SOCK;
+        const int before_bridge = played.load();
+        send_audio(8, 62345678, 1, &bridge_data);
+        std::this_thread::sleep_for(800ms);
+        bridge.flush(62346030);
+        std::this_thread::sleep_for(400ms);
+        require(played == before_bridge, "Pause bridge does not play during pause");
+        const auto bridge_resumed = Clock::now();
+        bridge.resume();
+        for (int i = 0; i < 40 && played == before_bridge; ++i) std::this_thread::sleep_for(10ms);
+        require(played == before_bridge + 1 && Clock::now() - bridge_resumed < 400ms,
+                "Resume restores pending PCM on a shifted timeline without a new sender packet");
+        send_audio(9, 63345678, 1, &bridge_data);
+        std::this_thread::sleep_for(100ms);
+        bridge.flush(63346382);
+        // Simulate the final in-flight packet arriving after the pause FLUSH.
+        send_audio(11, 63346030, 1, &bridge_data);
+        std::this_thread::sleep_for(50ms);
+        auto saved = bridge.suspend();
+        require(saved.pcm.size() == 2 && saved.output != nullptr,
+                "Partial teardown preserves paused PCM and the open audio device");
+        // This synthetic new sender has zero transmission lead.
+        saved.source_lead_frames = 0;
+        const int before_recreate = played.load();
+        Udp recreated_data;
+        ap::audio::AudioReceiver recreated;
+        auto recreated_config = bridge_config;
+        recreated_config.data_sock = recreated_data.fd;
+        const auto reopened = Clock::now();
+        require(recreated.start(recreated_config, std::move(saved)), "Recreate audio receiver");
+        recreated_data.fd = INVALID_SOCK;
+        require(Clock::now() - reopened < 300ms, "Recreated receiver reuses the audio device");
+        // New initial FLUSH must not erase the old session's paused tail.
+        recreated.flush(0xfffffe00U);
+        recreated.resume();
+        send_audio(10, 0xffffff00U, 0, &recreated_data, false);
+        for (int i = 0; i < 30 && played < before_recreate + 2; ++i) std::this_thread::sleep_for(10ms);
+        require(played == before_recreate + 2,
+                "Preserved PCM resumes before the new stream sends its first timing anchor");
+        std::this_thread::sleep_for(500ms);
+        unsigned char delayed_anchor[20]{};
+        delayed_anchor[0] = 0x80; delayed_anchor[1] = 0xd4;
+        put32(delayed_anchor + 4, 0xffffff00U);
+        put64(delayed_anchor + 8, remote_now());
+        send_to(sender, control, delayed_anchor, 20);
+        for (int i = 0; i < 40 && played < before_recreate + 3; ++i) std::this_thread::sleep_for(10ms);
+        require(played == before_recreate + 3,
+                "Recreated RTP epoch plays the preserved tail followed by new PCM");
+        recreated.stop(); ntp.stop();
         std::puts("PASS: IPv4 sender on dual-stack NTP socket; no repeated startup delay after FLUSH without a clock");
         SDL_Quit(); ap::net::global_shutdown();
         std::puts("PASS: NTP mapping, rollover, stale clock, timestamp playout, FLUSH, mirror mode and bounded shutdown");

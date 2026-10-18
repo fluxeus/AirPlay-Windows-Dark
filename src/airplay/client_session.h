@@ -24,7 +24,7 @@ struct ClientSession {
     ClientSession(const ap::crypto::Identity& id, std::string peer_ip,
                   int socket_fd = -1,
                   ap::video::VideoRenderer* r = nullptr,
-                  bool mirror_hwaccel_in = false)
+                  bool mirror_hwaccel_in = true)
         : identity(id), remote_ip(std::move(peer_ip)),
           fd(socket_fd), renderer(r),
           mirror_hwaccel(mirror_hwaccel_in) {}
@@ -56,7 +56,7 @@ struct ClientSession {
     // Used as a fallback when `live` is null. With `live` set, the
     // SETUP path reads `live->mirror_hwaccel.load()` so a UI toggle
     // takes effect on the next iPhone handshake.
-    bool mirror_hwaccel{false};
+    bool mirror_hwaccel{true};
 
     // Non-owning pointer to the shared user-tunable settings (set
     // when the renderer's UI exposes runtime knobs). May be null on

@@ -60,10 +60,14 @@ jobs:
         run: |
           cmake -S . -B build `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DBUILD_NETWORK_TESTS=ON `
             -G "Visual Studio 18 2026" -A x64
 
       - name: Build Release
         run: cmake --build build --config Release --parallel
+
+      - name: Run regression tests
+        run: ctest --test-dir build -C Release --output-on-failure
 
       - name: Package zip
         shell: pwsh
@@ -103,6 +107,8 @@ jobs:
           $notes = "docs/releases/${{ github.ref_name }}.md"
           if (Test-Path -LiteralPath $notes) {
             "path=$notes" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            $title = (Get-Content -LiteralPath $notes -TotalCount 1) -replace '^#\s+', ''
+            "title=$title" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
       - name: Publish release
@@ -116,4 +122,4 @@ jobs:
           fail_on_unmatched_files: true
           body_path: ${{ steps.release_notes.outputs.path }}
           generate_release_notes: true
-          name: AirPlay Windows ${{ github.ref_name }}
+          name: ${{ steps.release_notes.outputs.title || format('AirPlay Windows {0}', github.ref_name) }}

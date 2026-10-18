@@ -64,7 +64,7 @@ struct DeviceContext {
     // hardware acceleration on Windows — frames stay on the GPU
     // through color conversion and display. Software fallback is automatic when the
     // platform / driver can't honor the request.
-    bool                        mirror_hwaccel = false;
+    bool                        mirror_hwaccel = true;
 
     // Mutable settings exposed by the overlay UI. Optional — when
     // null, /info falls back to the static fields above. Lifetime

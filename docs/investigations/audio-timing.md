@@ -1,75 +1,70 @@
-# Audio-only playback timing (development build)
+# Audio-only timing and pause/resume
 
-The reported symptom is PC audio playing about 3–4 seconds before video on
-the iPhone when only the audio route is sent to the receiver. This differs
-from mirrored video lag and from delayed Windows audio output.
+These audio timing improvements are introduced in v0.4.0 after the v0.3.0 release.
 
-The v0.3.0 receiver sends decoded audio to SDL on arrival. The development
-branch `fix/audio-playback-latency` instead maps the sender's NTP clock to local
-steady time and combines this with RTP synchronization anchors from the audio
-control socket. It submits PCM near its scheduled presentation time. No fixed
-three-second delay is configured. Mirroring retains immediate audio submission.
+Audio-only playback maps sender NTP/RTP timestamps to a local steady clock.
+Clock responses validate the echoed request and RTT; samples expire and handle
+arbitrary sender epochs and rollover. IPv4 senders work with the production
+IPv6 dual-stack timing socket. Missing clocks have one bounded startup grace
+period rather than a new two-second wait on every FLUSH.
 
-The clock mapping accepts arbitrary sender epochs, checks the timing response's
-echo, filters excessive RTT, chooses a recent low-RTT sample, and expires stale
-measurements. A five-second decoded PCM bound and a two-second fallback wait
-prevent unbounded memory or permanent silence when synchronization is missing.
-FLUSH/PAUSE clear pending PCM and wake the playout thread. Hardware delay is
-estimated from the negotiated SDL buffer; this is not a hardware clock reading.
+Future PCM remains in a bounded application queue. SDL lookahead is limited
+to roughly 60 ms, including the estimated device buffer. Mirroring uses
+immediate submission. The output buffer estimate is not a hardware clock.
 
-SDL receives the decoder's exact frequency and channel count, with any required
-device conversion performed internally. See the primary
-[SDL_OpenAudioDevice documentation](https://wiki.libsdl.org/SDL2/SDL_OpenAudioDevice).
+## Pause and session lifetime
 
-## Validation
+Timestamped FLUSH respects the RTP boundary, including partial PCM blocks.
+Audio-only playback saves pending PCM for a subsequent explicit resume.
+Pause preservation is enabled normally; no diagnostic flag or environment
+variable is required. Short pauses rebase its timestamps; final in-flight
+pre-boundary packets are retained.
+Immediate FLUSH/resume pairs remain buffer resets. Saved audio expires after
+two minutes and is invalidated on changed track metadata or full disconnect.
 
-Configure with `-DBUILD_NETWORK_TESTS=ON`, build Release and run CTest.
-`test-audio-timing` uses native loopback UDP timing and control sockets, an
-ALAC encoder, AES-CBC encrypted RTP, the actual receiver, and SDL's dummy audio
-device. Renderer symbols are inert test stubs; no renderer is attached.
+For a partial type-96 teardown, the session retains the paused tail and open
+SDL device after joining the stream workers. Recreated audio of the same
+sample rate reuses them. The first fresh RTP packet establishes the new epoch.
+A local schedule permits the saved audio to play before the first new timing
+anchor. Sender transmission lead and one device-buffer margin align the join.
+The new live stream continues to follow the sender clock.
 
-The three-second-ahead fixture was submitted to SDL at approximately 2,977 ms,
-accounting for its estimated output buffer. Tests also cover NTP fractional and
-seconds rollover, RTP rollover, stale/invalid clock samples, FLUSH cancellation,
-immediate submission for mirroring, and stopping with a future frame pending.
-The socket lifecycle suite and all 26 protocol checks also passed locally.
+DACP command availability follows the control session, so an iPhone can close
+the media stream during pause and still receive Play from the PC. Mirroring
+and session-ID gating remain in force.
 
-This validates scheduling, not audible lip sync on a physical iPhone. The local
-build logs `Audio synchronized playout: initial_wait_ms=...` and
-`Audio playout: synchronized=...` to check whether real sender anchors are used.
-The user subsequently confirmed aligned PC audio and iPhone video in audio-only
-mode. A real sender log showed an initial scheduled wait of about 1,745 ms.
-This experiment is separate from the published v0.3.0 tag.
+## Validation and limits
 
-## Pause/resume follow-up
+`test-audio-timing` exercises actual UDP NTP/control sockets, encrypted ALAC,
+the receiver and SDL dummy output. Coverage includes clock/RTT validation,
+rollover, dual-stack IPv4, scheduled playback, timestamped FLUSH, mirror mode,
+bounded shutdown, missing-clock fallback, paused PCM/device transfer, delayed
+new timing anchors, and in-flight packets received after FLUSH.
 
-The initial scheduler could fill SDL with the sender's entire lead (about
-1.75 seconds in the real session). FLUSH then discarded that entire playback
-queue and all pending decoded PCM, ignoring the sender's `RTP-Info` boundary.
-The user reported a short missing segment when resuming.
+Physical listening tests confirmed musical playback after short and 15-second
+pauses. A 189-second stress run completed 24 pause/resume cycles (48 accepted
+commands), with no control loss, warning/error or late-drop report. Private
+memory decreased from 101,224,448 to 98,287,616 bytes; handles from 815 to 809.
+This verifies the tested duration, not the absence of all leaks.
 
-The follow-up limits SDL lookahead to roughly 60 ms including the estimated
-device buffer. Future PCM stays in the timestamped application queue. FLUSH
-with `rtptime` now removes only samples preceding that boundary, including
-partial PCM blocks and RTP rollover. Without a valid boundary it retains the
-previous full-reset behavior. The handling follows the timestamped flush
-semantics in [Shairport Sync's player](https://github.com/mikebrady/shairport-sync/blob/master/player.c).
-This does not infer that every FLUSH is a user pause or rebase the sender clock.
+An iTunes video clip remains a known limitation: the user observed a brief
+interruption or apparent repeated passage after resume. Fed queues and
+contiguous timestamps do not establish waveform continuity. Track metadata
+can arrive after playback starts, so every sender-side seek/track ordering is
+not validated. Experimental PCM comparison, correlation threads, local command
+hooks and temporary diagnostic executables have been removed. No clip-specific
+content matching or automatic overlap trimming is part of playback.
 
-Tests cover partial-block retention and full resets alongside synchronized
-playback. Logs include FLUSH boundaries and exact RTP progress for validation
-of the real iPhone pause/resume behavior, which still requires a physical test.
+## Audio-only interface pacing
 
-The next real test still skipped. Its trace exposed a separate fault: the
-session used an IPv4 sender with a dual-stack IPv6 timing socket, and Windows
-`getaddrinfo` failed with error 11001 for the numeric IPv4 address under
-`AF_INET6`/`AI_V4MAPPED`. NTP never started; every playout log was unsynchronized.
-The fallback also restarted its two-second acquisition wait after every FLUSH.
+CPU profiling identified SDL/Direct3D presentation as a significant cost during
+audio-only playback. The renderer now waits up to 33 ms rather than 16 ms for
+an Audio device. Video arrivals still satisfy the wake predicate immediately;
+other device modes retain the 16 ms timeout.
 
-The follow-up resolves the peer's actual family and explicitly builds IPv4-mapped
-IPv6 addresses when needed. Clock acquisition now has one startup deadline,
-not a deadline restarted whenever the PCM queue empties or is flushed.
-The integration test now matches the production dual-stack/IPv4 combination:
-it failed before the address fix and passes afterwards. An unresponsive timing
-peer test also verifies that a second FLUSH resumes without another two-second
-wait. Real iPhone pause/resume validation is still pending for this build.
+Both Release and RelWithDebInfo builds passed. Sequential live audio samples
+with the same WPR CPU profile measured 11.84% then 7.33% of one core (about 38%
+less). Memory was stable, the connection stayed established, and the window
+remained responsive. This is a single-machine measurement, not a guarantee
+for other tracks, window sizes or hardware. Subjective UI smoothness and
+mirroring cadence still require physical validation.

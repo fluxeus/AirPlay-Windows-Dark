@@ -235,7 +235,7 @@ bool StreamSession::setup_stream(int type,
         ac.ct          = opts.ct;
         ac.sample_rate = opts.sample_rate;
         ac.renderer    = renderer_;
-        if (!audio_->start(std::move(ac))) {
+        if (!audio_->start(std::move(ac), std::move(paused_audio_))) {
             LOG_WARN << "SETUP stream 96: AudioReceiver failed to start "
                         "(UDP socket left bound, no decrypt)";
             // If start() failed before taking ownership, we close the sock here.
@@ -252,6 +252,7 @@ bool StreamSession::setup_stream(int type,
         ch.data_sock    = INVALID_SOCK;   // consumed by AudioReceiver
         ch.control_sock = c_sock;
         channels_.push_back(ch);
+        audio_control_session_ = true;
         return true;
     }
 
@@ -274,7 +275,7 @@ void StreamSession::stop_stream(int type) {
         if (audio_) audio_->set_synchronized(true);
     }
     if (type == 96 && audio_) {
-        audio_->stop();
+        paused_audio_ = audio_->suspend();
         audio_.reset();
     }
     // Remove any audio channels matching the type.
@@ -308,14 +309,30 @@ void StreamSession::flush_audio(std::optional<uint32_t> boundary) {
     if (audio_) audio_->flush(boundary);
 }
 
+void StreamSession::resume_audio() {
+    if (audio_) audio_->resume();
+}
+
+void StreamSession::set_audio_track(const std::string& track) {
+    if (!audio_track_.empty() && track != audio_track_) {
+        paused_audio_ = {};
+        if (audio_) audio_->discard_pause();
+    }
+    audio_track_ = track;
+}
+
 bool StreamSession::audio_only() const {
     if (mirror_) return false;
+    if (audio_control_session_) return true;
     if (audio_) return true;
     for (const auto& channel : channels_) if (channel.type == 96) return true;
     return false;
 }
 
 void StreamSession::teardown() {
+    audio_control_session_ = false;
+    paused_audio_ = {};
+    audio_track_.clear();
     LOG_INFO << "StreamSession::teardown begin session=" << session_id_
              << " ntp=" << (ntp_ ? "yes" : "no")
              << " mirror=" << (mirror_ ? "yes" : "no")

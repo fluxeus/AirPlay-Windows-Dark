@@ -243,12 +243,7 @@ void NtpClient::thread_fn() {
                 clock_.observe(sent_steady, received_steady,
                     get_u64_be(response, 16), get_u64_be(response, 24));
             }
-            if (probes_received <= 3 || probes_received % 10 == 0)
-                LOG_INFO << "NTP timing sample: request_raw=" << get_u64_be(request, 24)
-                         << " echo_raw=" << get_u64_be(response, 8)
-                         << " remote_recv_raw=" << get_u64_be(response, 16)
-                         << " remote_send_raw=" << client_ref_time
-                         << " local_recv_ns=" << recv_time;
+
         }
         // else: timeout / no reply; send another probe next tick anyway.
 

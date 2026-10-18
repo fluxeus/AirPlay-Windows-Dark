@@ -501,12 +501,8 @@ Response handle_record(ClientSession& session, const Request& req) {
     }
     // iOS expects Session on RECORD response as well.
     r.set_header("Session", session.streams->session_id());
-    // TODO: once FairPlay blobs are provisioned and stream keys decrypted,
-    // spin up workers here that read from the bound UDP sockets. For now
-    // iOS's packets queue in the kernel — enough to confirm via Wireshark
-    // that the client did reach RECORD and is actively pushing media.
-    LOG_INFO << "RECORD: session=" << session.streams->session_id()
-             << " — stream worker not started (FairPlay blobs required)";
+    // Media workers are started by SETUP, once stream keys are available.
+    LOG_INFO << "RECORD: session=" << session.streams->session_id();
     // Resume-from-FLUSH path: iOS pauses with FLUSH and restarts the
     // stream with RECORD, so bring the "playing" flag back to true.
     if (session.renderer) session.renderer->push_playback_rate(1.0f);
@@ -708,6 +704,8 @@ Response handle_set_parameter(ClientSession& session, const Request& req) {
         (req.body.size() >= 4 && std::memcmp(req.body.data(), "mlit", 4) == 0)) {
         DaapMetadata md;
         if (parse_daap_mlit(req.body.data(), req.body.size(), md)) {
+            if (session.streams && !md.title.empty())
+                session.streams->set_audio_track(md.title + '\n' + md.artist + '\n' + md.album);
             LOG_INFO << "metadata: \"" << md.title
                      << "\" — " << md.artist
                      << " (" << md.album
@@ -1527,6 +1525,7 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "POST" && path == "/reverse")          return handle_reverse(session, req);
     if (req.method == "GET"  && path == "/server-info")      return handle_server_info(ctx, req);
     if (req.method == "POST" && path == "/audioMode")        {
+        if (session.streams) session.streams->resume_audio();
         // Observed as the resume-from-pause signal on some iOS flows
         // (no RECORD, no new SETUP — just an audioMode announcement
         // followed by the RTP stream kicking back in). Flip the renderer

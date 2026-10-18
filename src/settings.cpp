@@ -28,9 +28,8 @@ std::filesystem::path settings_path() {
 #endif
 }
 
-PersistentSettings load_settings() {
+PersistentSettings load_settings(const std::filesystem::path& path) {
     PersistentSettings s;
-    const std::filesystem::path path = settings_path();
     if (path.empty()) return s;
 
     std::ifstream in(path);
@@ -75,6 +74,36 @@ PersistentSettings load_settings() {
                 const int n = std::stoi(val);
                 if (n >= -1 && n <= 3) s.video_rotation = n;
             }
+            else if (key == "diagnostics") s.ui.diagnostics = std::stoi(val) != 0;
+            else if (key == "window_placement_valid") s.ui.window_placement_valid = std::stoi(val) != 0;
+            else if (key == "window_maximized") s.ui.window_maximized = std::stoi(val) != 0;
+            else if (key == "window_x" || key == "window_y") {
+                const int n = std::stoi(val);
+                if (n >= -100000 && n <= 100000) {
+                    if (key == "window_x") s.ui.window_x = n;
+                    else s.ui.window_y = n;
+                }
+            }
+            else if (key == "window_width" || key == "window_height") {
+                const int n = std::stoi(val);
+                if (n >= 160 && n <= 32768) {
+                    if (key == "window_width") s.ui.window_width = n;
+                    else s.ui.window_height = n;
+                }
+            }
+            else if (key == "recording_directory") s.ui.recording_directory = val;
+            else if (key == "recording_codec") {
+                const int n = std::stoi(val);
+                if (n >= 0 && n <= 1) s.ui.recording_codec = n;
+            }
+            else if (key == "recording_encoder") {
+                const int n = std::stoi(val);
+                if (n >= 0 && n <= 2) s.ui.recording_encoder = n;
+            }
+            else if (key == "recording_bitrate") {
+                const int n = std::stoi(val);
+                if (n >= 2 && n <= 40) s.ui.recording_bitrate = n;
+            }
         } catch (...) {
             LOG_WARN << "settings: malformed value for " << key << "=" << val;
         }
@@ -83,21 +112,22 @@ PersistentSettings load_settings() {
     return s;
 }
 
-void save_settings(const PersistentSettings& s) {
-    const std::filesystem::path path = settings_path();
-    if (path.empty()) return;
+bool save_settings(const PersistentSettings& s, const std::filesystem::path& path) {
+    if (path.empty()) return false;
 
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) {
         LOG_WARN << "settings: could not create directory: " << ec.message();
-        return;
+        return false;
     }
 
-    std::ofstream out(path, std::ios::trunc);
+    auto temporary = path;
+    temporary += ".tmp";
+    std::ofstream out(temporary, std::ios::trunc);
     if (!out.is_open()) {
         LOG_WARN << "settings: could not write " << path.u8string();
-        return;
+        return false;
     }
 
     out << "receiver_name=" << s.receiver_name << '\n'
@@ -110,9 +140,35 @@ void save_settings(const PersistentSettings& s) {
         << "vsync_enabled="  << s.vsync_enabled  << '\n'
         << "fullscreen="     << s.fullscreen     << '\n'
         << "chromeless="     << s.chromeless     << '\n'
-        << "video_rotation=" << s.video_rotation << '\n';
+        << "video_rotation=" << s.video_rotation << '\n'
+        << "diagnostics=" << s.ui.diagnostics << '\n'
+        << "window_placement_valid=" << s.ui.window_placement_valid << '\n'
+        << "window_x=" << s.ui.window_x << '\n'
+        << "window_y=" << s.ui.window_y << '\n'
+        << "window_width=" << s.ui.window_width << '\n'
+        << "window_height=" << s.ui.window_height << '\n'
+        << "window_maximized=" << s.ui.window_maximized << '\n'
+        << "recording_directory=" << s.ui.recording_directory << '\n'
+        << "recording_codec=" << s.ui.recording_codec << '\n'
+        << "recording_encoder=" << s.ui.recording_encoder << '\n'
+        << "recording_bitrate=" << s.ui.recording_bitrate << '\n';
+    out.close();
+    if (!out) {
+        LOG_WARN << "settings: could not finish writing " << temporary.u8string();
+        return false;
+    }
+#if defined(_WIN32)
+    if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        LOG_WARN << "settings: could not replace file, Windows error " << GetLastError();
+        return false;
+    }
+#else
+    std::filesystem::rename(temporary, path, ec);
+    if (ec) return false;
+#endif
 
     LOG_INFO << "settings: saved to " << path.u8string();
+    return true;
 }
 
 PersistentSettings snapshot(const ap::airplay::LiveSettings& live) {
@@ -128,6 +184,7 @@ PersistentSettings snapshot(const ap::airplay::LiveSettings& live) {
     s.fullscreen     = live.fullscreen.load(std::memory_order_relaxed);
     s.chromeless     = live.chromeless.load(std::memory_order_relaxed);
     s.video_rotation = live.video_rotation.load(std::memory_order_relaxed);
+    s.ui = live.ui_preferences();
     return s;
 }
 

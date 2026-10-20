@@ -25,6 +25,9 @@ bool global_init();
 void global_shutdown();
 
 void close_socket(socket_t s);
+// Detect unreachable TCP peers without treating a paused stream as a disconnect.
+bool enable_tcp_keepalive(socket_t s, int idle_seconds = 5,
+                          int interval_seconds = 1, int probes = 5);
 int  last_error();
 std::string last_error_string();
 

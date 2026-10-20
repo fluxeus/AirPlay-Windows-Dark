@@ -49,6 +49,12 @@ bool Server::control_audio(MediaCommand command, uint32_t position_ms, const std
 }
 
 void Server::handle_client(ap::net::ClientSocket client) {
+    // TCP probes are acknowledged even when media is paused or the screen
+    // is static. An unreachable phone must not retain the session forever.
+    if (!ap::net::enable_tcp_keepalive(client.fd)) {
+        LOG_WARN << "Could not configure control TCP keepalive: "
+                 << ap::net::last_error_string();
+    }
     RequestReader reader(client.cancelled);
     Request req;
 
@@ -105,7 +111,12 @@ void Server::handle_client(ap::net::ClientSocket client) {
              << " receiver_cancelled=" << client.cancelled->load()
              << " streams=" << (session.streams ? "yes" : "no");
     // Close the media transports before releasing the control connection.
+    const std::string ended_session = session.streams
+        ? session.streams->session_id() : std::string{};
     session.streams.reset();
+    if (ctx_.renderer && !ended_session.empty()) {
+        ctx_.renderer->clear_session_if_active(ended_session);
+    }
     LOG_INFO << "closing " << client.peer;
     {
         std::lock_guard<std::mutex> lock(remotes_mutex_);

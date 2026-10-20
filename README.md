@@ -3,8 +3,8 @@
 Native AirPlay receiver for Windows: screen mirroring, RAOP audio and MP4
 recording, based on [UxPlay](https://github.com/FDH2/UxPlay).
 
-Latest release: [v0.4.0](https://github.com/moieric11/AirPlay-Windows/releases/tag/v0.4.0)
-— [what changed](docs/releases/v0.4.0.md).
+Latest release: [v0.4.1](https://github.com/moieric11/AirPlay-Windows/releases/tag/v0.4.1)
+— [what changed](docs/releases/v0.4.1.md).
 
 ![AirPlay Windows interface with Home, Music, Screen Mirroring and Settings navigation](docs/images/interface-preview.png)
 

@@ -111,6 +111,10 @@ jobs:
           try {
             python tools/test_pair_verify.py
             $testCode = $LASTEXITCODE
+            if ($testCode -eq 0) {
+              python tools/test_connection_loss.py airplay.stderr.log
+              $testCode = $LASTEXITCODE
+            }
           } finally {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           }

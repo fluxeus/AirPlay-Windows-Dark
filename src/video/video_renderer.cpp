@@ -54,7 +54,7 @@ constexpr int kDefaultWinWidth  = 1220;
 constexpr int kDefaultWinHeight = 800;
 constexpr int kSidebarWidth     = 190;
 constexpr int kOptionsWidth     = 380;
-constexpr int kStatusBarHeight  = 28;
+constexpr int kStatusLineHeight = 24;
 constexpr int kToolbarHeight    = 45;
 constexpr const char* kRotationModes[] = {
     "Automatic (device)", "Manual: 0 degrees", "Manual: 90 degrees",
@@ -605,6 +605,16 @@ void VideoRenderer::clear_active_device() {
     std::lock_guard<std::mutex> lock(device_mtx_);
     has_device_ = false;
     device_     = {};
+}
+
+bool VideoRenderer::clear_session_if_active(const std::string& session_id) {
+    std::lock_guard<std::mutex> lock(device_mtx_);
+    if (!has_device_ || device_.session_id != session_id) return false;
+    clear_session();
+    has_device_ = false;
+    device_ = {};
+    LOG_INFO << "Connection ended: cleared active session=" << session_id;
+    return true;
 }
 
 void VideoRenderer::set_audio_control_handler(
@@ -1469,7 +1479,10 @@ void VideoRenderer::run(const std::string& title) {
         const int firewall_offset=firewall_notice ? (firewall.message.empty()?124:150) : 0;
         const int options_w     = 0; // Settings overlay the content, as in the approved design.
         const int chrome_top    = no_chrome ? 0 : kToolbarHeight;
-        const int chrome_bottom = no_chrome || !ui.diagnostics ? 0 : kStatusBarHeight;
+        const int diagnostics_columns = std::clamp((full_w - 20) / 300, 1, 4);
+        const int diagnostics_rows = (9 + diagnostics_columns - 1) / diagnostics_columns;
+        const int chrome_bottom = no_chrome || !ui.diagnostics
+            ? 0 : diagnostics_rows * kStatusLineHeight + 8;
         const int chrome_left   = no_chrome ? 0 : kSidebarWidth;
         const int stage_x = chrome_left;
         const int stage_y = chrome_top;
@@ -1708,17 +1721,17 @@ void VideoRenderer::run(const std::string& title) {
         ImGui::End(); ImGui::PopStyleVar();
 
         ImGui::SetNextWindowPos(ImVec2(0,toolbar_h));
-        ImGui::SetNextWindowSize(ImVec2(side_bar_w,fh-toolbar_h));
+        ImGui::SetNextWindowSize(ImVec2(side_bar_w,fh-toolbar_h-status_bar_h));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(14,29));
         ImGui::Begin("##navigation",nullptr,kPanelFlags|ImGuiWindowFlags_NoScrollbar);
         auto* rail=ImGui::GetWindowDrawList();
-        rail->AddLine(ImVec2(side_bar_w-1,toolbar_h),ImVec2(side_bar_w-1,fh),line);
+        rail->AddLine(ImVec2(side_bar_w-1,toolbar_h),ImVec2(side_bar_w-1,fh-status_bar_h),line);
         ImGui::PushFont(small_font); ImGui::SetCursorPosX(26); ImGui::TextDisabled("YOUR SPACE"); ImGui::PopFont();
         ImGui::Dummy(ImVec2(0,5));
         if (ui_draw::nav("##home","Home",ui_draw::Icon::Home,ui.page==0,162,ui.page==0?bold_font:io.FontDefault)) ui.page=0;
         if (ui_draw::nav("##music","Music",ui_draw::Icon::Music,ui.page==1,162,ui.page==1?bold_font:io.FontDefault)) ui.page=1;
         if (ui_draw::nav("##mirror","Screen mirroring",ui_draw::Icon::Screen,ui.page==2,162,ui.page==2?bold_font:io.FontDefault)) ui.page=2;
-        ImGui::SetCursorPosY(fh-toolbar_h-150);
+        ImGui::SetCursorPosY(fh-toolbar_h-status_bar_h-150);
         if (ui_draw::nav("##settings","Settings",ui_draw::Icon::Settings,ui.settings_open,162,io.FontDefault)) ui.settings_open=!ui.settings_open;
         ImGui::Separator(); ImGui::Dummy(ImVec2(0,3));
         ImGui::PushFont(small_font);
@@ -1940,7 +1953,7 @@ void VideoRenderer::run(const std::string& title) {
         // Settings are a drawer above the current view, not a permanent sidebar.
         if (ui.settings_open) {
             ImGui::SetNextWindowPos(ImVec2(0,toolbar_h));
-            ImGui::SetNextWindowSize(ImVec2(fw-opts_bar_w,fh-toolbar_h));
+            ImGui::SetNextWindowSize(ImVec2(fw-opts_bar_w,fh-toolbar_h-status_bar_h));
             ImGui::PushStyleColor(ImGuiCol_WindowBg,ImVec4(.11f,.17f,.20f,.18f));
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
             ImGui::Begin("##settings_shade",nullptr,kPanelFlags|ImGuiWindowFlags_NoScrollbar);
@@ -2316,11 +2329,14 @@ void VideoRenderer::run(const std::string& title) {
 #else
             constexpr const char* kHlsBackend = "libavformat";
 #endif
+            // Wrap complete metrics into equal-width columns instead of
+            // clipping a single long line at the edge of the window.
+            if (ImGui::BeginTable("##diagnostics_metrics", diagnostics_columns,
+                                  ImGuiTableFlags_SizingStretchSame)) {
             const auto sep = [&]() {
-                ImGui::SameLine();
-                ImGui::TextDisabled(" | ");
-                ImGui::SameLine();
+                ImGui::TableNextColumn();
             };
+            ImGui::TableNextColumn();
             // "Streaming" = paired AND frames flowing; "Connected" =
             // paired but iOS quiet (static menu, paused video — common
             // in mirror); "Idle" = nothing connected.
@@ -2377,6 +2393,8 @@ void VideoRenderer::run(const std::string& title) {
             ImGui::Text("Lat: %.1f ms", has_video ? lat_ms : 0.0f);
             sep();
             ImGui::TextDisabled("HLS backend: %s", kHlsBackend);
+            ImGui::EndTable();
+            }
         }
         ImGui::End();
         ImGui::PopStyleVar();

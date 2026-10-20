@@ -14,6 +14,11 @@
 #include <iostream>
 #include <thread>
 #include <vector>
+#if defined(_WIN32)
+#include <mstcpip.h>
+#else
+#include <netinet/tcp.h>
+#endif
 
 using namespace std::chrono_literals;
 namespace {
@@ -99,6 +104,56 @@ void test_control_shutdown() {
     }
     std::cout << "PASS: disconnect, EOF/reset, cleanup ordering, reconnect, active stop, restart (5 rounds)\n";
 }
+void test_keepalive_and_reset() {
+    ap::net::TcpServer server;
+    std::atomic<int> started{0}, cleaned{0};
+    require(server.start(0, [&](ap::net::ClientSocket client) {
+        require(ap::net::enable_tcp_keepalive(client.fd), "configure control keepalive");
+        const auto check_option = [&](int level, int option, int expected) {
+            int value = 0;
+#if defined(_WIN32)
+            int length = sizeof(value);
+#else
+            socklen_t length = sizeof(value);
+#endif
+            require(getsockopt(client.fd, level, option,
+                    reinterpret_cast<char*>(&value), &length) == 0 && value == expected,
+                    "TCP keepalive policy is applied to the socket");
+        };
+        check_option(SOL_SOCKET, SO_KEEPALIVE, 1);
+        check_option(IPPROTO_TCP, TCP_KEEPIDLE, 5);
+        check_option(IPPROTO_TCP, TCP_KEEPINTVL, 1);
+        check_option(IPPROTO_TCP, TCP_KEEPCNT, 5);
+        ++started;
+        ap::airplay::RequestReader reader(client.cancelled);
+        ap::airplay::Request request;
+        while (reader.read(client.fd, request)) {
+            require(ap::net::send_all(client.fd, "OK\n", 3) == 3, "idle peer response");
+        }
+        ++cleaned;
+    }), "keepalive server");
+    auto client = connect_to(server.port());
+    wait_for([&] { return started == 1; });
+    // A reachable phone in pause must survive the keepalive idle interval.
+    std::this_thread::sleep_for(6s);
+    const std::string request = "OPTIONS / RTSP/1.0\r\nContent-Length: 0\r\n\r\n";
+    require(ap::net::send_all(client, request.data(), static_cast<int>(request.size())) > 0,
+            "paused peer remains connected");
+    char reply[3];
+    require(ap::net::recv_all(client, reply, 3) == 3, "paused peer can resume requests");
+    linger reset{1, 0};
+    require(setsockopt(client, SOL_SOCKET, SO_LINGER,
+            reinterpret_cast<const char*>(&reset), sizeof(reset)) == 0, "abortive peer close");
+    ap::net::close_socket(client);
+    wait_for([&] { return cleaned == 1; });
+    auto reconnected = connect_to(server.port());
+    wait_for([&] { return started == 2; });
+    server.stop();
+    check_closed(reconnected);
+    require(cleaned == 2, "reset and reconnection both release their session");
+    std::cout << "PASS: TCP keepalive policy, paused peer survival, abrupt reset cleanup and reconnect\n";
+}
+
 void test_completed_workers() {
 #if defined(_WIN32)
     ap::net::TcpServer server;
@@ -238,8 +293,9 @@ int main(int argc, char** argv) {
     require(ap::net::global_init(), "Winsock");
     ap::set_log_enabled(true);
     // Bound failures even when a regression blocks a worker join forever.
-    std::thread([] { std::this_thread::sleep_for(20s); std::_Exit(2); }).detach();
+    std::thread([] { std::this_thread::sleep_for(30s); std::_Exit(2); }).detach();
     test_control_shutdown();
+    test_keepalive_and_reset();
     test_completed_workers();
     test_blocked_send();
     if (argc > 1 && std::string(argv[1]) == "--mdns") test_mdns();

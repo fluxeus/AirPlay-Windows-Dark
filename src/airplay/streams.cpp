@@ -182,6 +182,9 @@ bool StreamSession::setup_stream(int type,
     if (type == 110) {
         mirror_ = std::make_unique<MirrorListener>();
 
+        // Decoder initialization needs the renderer's D3D11 device.
+        if (renderer_) mirror_->attach_renderer(renderer_);
+
         // Wire AES-CTR decryption before starting the accept loop.
         if (!opts.aes_key.empty() && opts.stream_connection_id != 0) {
             if (!mirror_->enable_decrypt(opts.aes_key, opts.stream_connection_id,
@@ -190,7 +193,6 @@ bool StreamSession::setup_stream(int type,
                             "(stream will be logged encrypted)";
             }
         }
-        if (renderer_) mirror_->attach_renderer(renderer_);
 
         uint16_t p = 0;
         if (!mirror_->start(p)) {

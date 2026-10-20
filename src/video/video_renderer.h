@@ -170,6 +170,8 @@ public:
     };
     void set_active_device(DeviceInfo info);
     void clear_active_device();
+    // Atomically clear only this session, leaving a newer connection intact.
+    bool clear_session_if_active(const std::string& session_id);
     bool active_device_snapshot(DeviceInfo& out) const;
 
     // Hand the renderer a (non-owning) pointer to the user-tunable
